@@ -1,5 +1,5 @@
 {
-  description = "Experimental Nix flake for PhotoCraft";
+  description = "Experimental Nix flake for ArtCraft Launcher";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -19,6 +19,8 @@
           extensions = [ "rustfmt" "clippy" "rust-src" ];
         };
 
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
         commonDeps = with pkgs; [
           pkg-config
           openssl
@@ -33,7 +35,6 @@
           mesa
           wayland
           wayland-protocols
-          gtk3
           fontconfig
           freetype
           alsa-lib
@@ -57,8 +58,8 @@
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "photocraft";
-          version = "0.5.0";
+          pname = "artcraft-launcher";
+          version = version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
@@ -75,7 +76,7 @@
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/photocraft";
+          program = "${self.packages.${system}.default}/bin/artcraft-launcher";
         };
       });
 }
