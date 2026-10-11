@@ -25,11 +25,11 @@
           pkg-config
           openssl
           libxkbcommon
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXrandr
-          xorg.libXi
-          xorg.libxcb
+          libx11
+          libxcursor
+          libxrandr
+          libxi
+          libxcb
           libGL
           vulkan-loader
           mesa
