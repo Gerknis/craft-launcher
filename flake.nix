@@ -65,11 +65,17 @@
 
           nativeBuildInputs = with pkgs; [
             pkg-config
-            cmake
-            ninja
             libclang
+            autoPatchelfHook
           ];
           buildInputs = commonDeps;
+
+          runtimeDependencies = with pkgs; [
+            wayland
+            libxkbcommon
+            libGL
+            vulkan-loader
+          ];
 
           doCheck = false;
         };
