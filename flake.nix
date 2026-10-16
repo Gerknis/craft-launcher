@@ -75,6 +75,12 @@
             libxkbcommon
             libGL
             vulkan-loader
+            #X11 support
+            libx11
+            libxcursor
+            libxrandr
+            libxi
+            libxcb
           ];
 
           doCheck = false;
