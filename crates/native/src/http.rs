@@ -55,8 +55,11 @@ impl Http {
         // and trusts what antivirus HTTPS scanning installs. Reading the store ourselves missed
         // both ("invalid peer certificate: UnknownIssuer").
         let tls = || ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
+        // Chosen once: the proxy environment variables, else the OS proxy setting.
+        let proxy = crate::proxy::pick();
         let small = ureq::Agent::config_builder()
             .tls_config(tls())
+            .proxy(proxy.clone())
             .timeout_global(Some(Duration::from_secs(20)))
             .http_status_as_error(false)
             .user_agent(USER_AGENT)
@@ -64,6 +67,7 @@ impl Http {
             .new_agent();
         let feed = ureq::Agent::config_builder()
             .tls_config(tls())
+            .proxy(proxy.clone())
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_global(Some(Duration::from_secs(10)))
             .http_status_as_error(false)
@@ -72,6 +76,7 @@ impl Http {
             .new_agent();
         let no_redirect = ureq::Agent::config_builder()
             .tls_config(tls())
+            .proxy(proxy.clone())
             .timeout_global(Some(Duration::from_secs(20)))
             .http_status_as_error(false)
             .max_redirects(0)
@@ -81,6 +86,7 @@ impl Http {
             .new_agent();
         let download = ureq::Agent::config_builder()
             .tls_config(tls())
+            .proxy(proxy.clone())
             .timeout_connect(Some(Duration::from_secs(20)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             // ureq has no idle timeout: cap each attempt instead, and resume where it stopped.
@@ -120,12 +126,11 @@ impl Http {
             404 => Ok(Fetched::NotFound),
             403 | 429 => {
                 let remaining = header("x-ratelimit-remaining");
-                let reset = header("x-ratelimit-reset").and_then(|r| r.parse::<i64>().ok());
-                let retry_after = header("retry-after").and_then(|r| r.parse::<i64>().ok()).map(|s| crate::now() + s);
-                if status == 429 || remaining.as_deref() == Some("0") || retry_after.is_some() {
-                    Ok(Fetched::RateLimited { reset: reset.or(retry_after) })
-                } else {
-                    Err(format!("GitHub refused the request (HTTP {status})"))
+                let reset = header("x-ratelimit-reset").and_then(|r| r.trim().parse::<i64>().ok());
+                let retry_after = header("retry-after").and_then(|r| r.trim().parse::<i64>().ok());
+                match refused_until(status, remaining.as_deref(), reset, retry_after, crate::now()) {
+                    Some(reset) => Ok(Fetched::RateLimited { reset }),
+                    None => Err(format!("GitHub refused the request (HTTP {status})")),
                 }
             }
             s => Err(format!("GitHub answered HTTP {s}")),
@@ -155,6 +160,27 @@ impl Http {
         }
     }
 
+    /// GET a small binary file (following redirects). `Ok(None)` for a 404. A file of more than
+    /// `max` bytes is refused: by its announced length before a byte is read, and by a hard limit
+    /// on the body when the length wasn't announced or was wrong.
+    pub fn get_bytes(&self, url: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
+        let mut resp = self.small.get(url).call().map_err(|e| format!("couldn't reach {} ({e})", host(url)))?;
+        match resp.status().as_u16() {
+            200 => {
+                let announced = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+                let too_big = || format!("{} sent more than {max} bytes", host(url));
+                if announced.is_some_and(|n| n > max as u64) {
+                    return Err(too_big());
+                }
+                // ureq errors once the limit is reached, so ask for one byte more than we accept.
+                let body = resp.body_mut().with_config().limit(max as u64 + 1).read_to_vec().map_err(|e| format!("unreadable answer ({e})"))?;
+                if body.len() > max { Err(too_big()) } else { Ok(Some(body)) }
+            }
+            404 => Ok(None),
+            s => Err(format!("{} answered HTTP {s}", host(url))),
+        }
+    }
+
     /// Where `url` redirects to, without following it.
     pub fn redirect_target(&self, url: &str) -> Result<Option<String>, String> {
         let resp = self.no_redirect.head(url).call().map_err(|e| format!("couldn't reach {} ({e})", host(url)))?;
@@ -173,24 +199,15 @@ impl Http {
     /// its partial file; a file that fails its checksum is fetched once more from scratch before
     /// giving up. When the connection stays down, the download ends paused (`PAUSED`), never
     /// losing what it has. `stop` pauses or cancels it between reads.
-    pub fn download(
-        &self,
-        url: &str,
-        dest: &Path,
-        size: u64,
-        sha256: Option<&str>,
-        stop: &Stop,
-        progress: &mut dyn FnMut(Transfer),
-    ) -> Result<Verified, String> {
+    pub fn download(&self, url: &str, dest: &Path, size: u64, sha256: &str, stop: &Stop, progress: &mut dyn FnMut(Transfer)) -> Result<(), String> {
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
         }
-        let verified = if sha256.is_some() { Verified::Checksum } else { Verified::SizeOnly };
         // A finished copy from an earlier attempt that never got installed. Marking it as just
         // used, before checking it, keeps `clean_downloads` away from it while it's installed.
-        if dest.is_file() && touch(dest) && matches_published(dest, size, sha256) {
+        if dest.is_file() && touch(dest) && matches_published(dest, sha256) {
             progress(Transfer::Bytes { done: size, total: size });
-            return Ok(verified);
+            return Ok(());
         }
         // The partial file is named after the release file and its size; if it still turns out
         // to belong to something else, the checksum catches it and the download starts over.
@@ -205,9 +222,9 @@ impl Http {
                 }
                 return Err(e);
             }
-            if matches_published(&part, size, sha256) {
+            if matches_published(&part, sha256) {
                 std::fs::rename(&part, dest).map_err(|e| format!("couldn't save the download ({e})"))?;
-                return Ok(verified);
+                return Ok(());
             }
             let _ = std::fs::remove_file(&part);
             if fresh_start_used {
@@ -354,15 +371,6 @@ pub enum Transfer {
     },
 }
 
-/// How a finished download was checked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verified {
-    /// Against the release's published SHA-256.
-    Checksum,
-    /// The release publishes no checksum: only its size could be checked.
-    SizeOnly,
-}
-
 /// Asks a running download to pause (keeping its partial file) or cancel (deleting it).
 #[derive(Debug, Default)]
 pub struct Stop(AtomicU8);
@@ -390,12 +398,9 @@ impl Stop {
     }
 }
 
-/// Whether a file on disk is the published one: its checksum when there is one, else its size.
-fn matches_published(path: &Path, size: u64, sha256: Option<&str>) -> bool {
-    match sha256 {
-        Some(sha) => sha256_file(path).is_ok_and(|h| h.eq_ignore_ascii_case(sha)),
-        None => size > 0 && std::fs::metadata(path).is_ok_and(|m| m.len() == size),
-    }
+/// Whether a file on disk is the published one: its SHA-256 matches.
+fn matches_published(path: &Path, sha256: &str) -> bool {
+    sha256_file(path).is_ok_and(|h| h.eq_ignore_ascii_case(sha256))
 }
 
 /// How much of a download is already on disk (a paused or interrupted one).
@@ -496,6 +501,25 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// Whether a 403 or 429 from GitHub's API means "slow down", and until when (Unix seconds, when
+/// it says). `None`: refused for some other reason.
+///
+/// GitHub sends `x-ratelimit-reset` with every answer: it's when the hourly quota refills, which
+/// only matters once `x-ratelimit-remaining` is 0. A secondary limit says how long to wait in
+/// `Retry-After` (seconds) and leaves the hourly quota alone; without either, GitHub's advice is
+/// to wait a minute.
+fn refused_until(status: u16, remaining: Option<&str>, reset: Option<i64>, retry_after: Option<i64>, now: i64) -> Option<Option<i64>> {
+    let retry = retry_after.map(|secs| now.saturating_add(secs.max(0)));
+    if remaining.map(str::trim) == Some("0") {
+        // `None` sorts first: whichever of the two is known, and the later if both are.
+        return Some(reset.max(retry));
+    }
+    if retry.is_some() {
+        return Some(retry);
+    }
+    (status == 429).then_some(Some(now.saturating_add(60)))
+}
+
 fn host(url: &str) -> &str {
     url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(url)
 }
@@ -540,18 +564,18 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("file.bin");
         let http = Http::new().unwrap();
-        http.download(&url, &dest, len, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        http.download(&url, &dest, len, &sha, &Stop::default(), &mut |_| {}).unwrap();
         assert!(finished(&dest, len) && !finished(&dest, 0));
         // Old enough to be cleaned up, were it not about to be used.
         let old = std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
         std::fs::File::options().write(true).open(&dest).unwrap().set_modified(old).unwrap();
         let mut last = (0, 0);
-        let again = http.download(&url, &dest, len, Some(&sha), &Stop::default(), &mut |t| {
+        let again = http.download(&url, &dest, len, &sha, &Stop::default(), &mut |t| {
             if let Transfer::Bytes { done, total } = t {
                 last = (done, total);
             }
         });
-        assert_eq!(again, Ok(Verified::Checksum));
+        assert_eq!(again, Ok(()));
         assert_eq!(last, (len, len));
         assert_eq!(requests.lock().unwrap().len(), 1);
         // A cleanup while the installer runs leaves the reused file alone.
@@ -569,10 +593,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("file.bin");
         let http = Http::new().unwrap();
-        http.download(&url, &dest, len, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        http.download(&url, &dest, len, &sha, &Stop::default(), &mut |_| {}).unwrap();
         // The same size, so only the checksum can tell.
         std::fs::write(&dest, vec![b'x'; body.len()]).unwrap();
-        http.download(&url, &dest, len, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        http.download(&url, &dest, len, &sha, &Stop::default(), &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
@@ -665,20 +689,36 @@ pub(crate) mod tests {
         let dest = dir.path().join("file.bin");
         let http = Http::new().unwrap();
         let mut last = (0, 0);
-        let result = http.download(&url, &dest, body.len() as u64, Some(&sha), &Stop::default(), &mut |t| {
+        let result = http.download(&url, &dest, body.len() as u64, &sha, &Stop::default(), &mut |t| {
             if let Transfer::Bytes { done, total } = t {
                 last = (done, total);
             }
         });
-        let result = result.map(|v| {
-            assert_eq!(v, Verified::Checksum);
-            std::fs::read(&dest).unwrap()
-        });
+        let result = result.map(|()| std::fs::read(&dest).unwrap());
         if result.is_ok() {
             assert_eq!(last, (body.len() as u64, body.len() as u64));
         }
         let seen = ranges.lock().unwrap().clone();
         (result, seen)
+    }
+
+    #[test]
+    fn small_binary_files_are_read_whole_and_a_404_is_none() {
+        let (body, _) = body();
+        let http = Http::new().unwrap();
+        let (url, _) = serve(body.clone(), vec![Reply::Full]);
+        assert_eq!(http.get_bytes(&url, body.len()).unwrap(), Some(body.clone()), "a body of exactly the cap is fine");
+        let (url, _) = serve(body, vec![Reply::Missing]);
+        assert_eq!(http.get_bytes(&url, 1 << 20).unwrap(), None);
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_refused() {
+        let (body, _) = body();
+        let http = Http::new().unwrap();
+        let (url, _) = serve(body.clone(), vec![Reply::Full]);
+        let err = http.get_bytes(&url, body.len() - 1).unwrap_err();
+        assert!(err.contains("more than"), "{err}");
     }
 
     #[test]
@@ -710,17 +750,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn without_a_checksum_the_size_is_still_checked() {
-        let (body, _) = body();
-        let (url, _) = serve(body.clone(), vec![Reply::Full]);
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("file.bin");
-        let v = Http::new().unwrap().download(&url, &dest, body.len() as u64, None, &Stop::default(), &mut |_| {}).unwrap();
-        assert_eq!(v, Verified::SizeOnly);
-        assert_eq!(std::fs::read(&dest).unwrap(), body);
-    }
-
-    #[test]
     fn pausing_keeps_the_partial_file_and_resuming_continues_it() {
         let (body, sha) = body();
         let len = body.len() as u64;
@@ -731,7 +760,7 @@ pub(crate) mod tests {
         let stop = Stop::default();
         // Pause as soon as the first bytes arrive.
         let err = http
-            .download(&url, &dest, len, Some(&sha), &stop, &mut |t| {
+            .download(&url, &dest, len, &sha, &stop, &mut |t| {
                 if matches!(t, Transfer::Bytes { done, .. } if done > 0) {
                     stop.pause();
                 }
@@ -740,7 +769,7 @@ pub(crate) mod tests {
         assert_eq!(err, PAUSED);
         let kept = partial_bytes(&dest, len).unwrap();
         assert!(kept > 0 && kept < len, "{kept}");
-        http.download(&url, &dest, len, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        http.download(&url, &dest, len, &sha, &Stop::default(), &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert_eq!(ranges.lock().unwrap()[1], Some(kept.to_string()));
     }
@@ -755,7 +784,7 @@ pub(crate) mod tests {
         let stop = Stop::default();
         let err = Http::new()
             .unwrap()
-            .download(&url, &dest, len, Some(&sha), &stop, &mut |t| {
+            .download(&url, &dest, len, &sha, &stop, &mut |t| {
                 if matches!(t, Transfer::Bytes { done, .. } if done > 0) {
                     stop.cancel();
                 }
@@ -780,7 +809,7 @@ pub(crate) mod tests {
         let dest = dir.path().join("file.bin");
         std::fs::write(part_path(&dest, body.len() as u64), &body[..500_000]).unwrap();
         assert_eq!(partial_bytes(&dest, body.len() as u64), Some(500_000));
-        Http::new().unwrap().download(&url, &dest, body.len() as u64, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        Http::new().unwrap().download(&url, &dest, body.len() as u64, &sha, &Stop::default(), &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert_eq!(*ranges.lock().unwrap(), [Some("500000".to_string())]);
         assert!(!part_path(&dest, body.len() as u64).exists());
@@ -801,8 +830,63 @@ pub(crate) mod tests {
         let sha = asset.sha256.clone().or_else(|| sums.iter().find(|(_, n)| *n == asset.name).map(|(h, _)| h.clone())).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(&asset.name);
-        http.download(&asset.url, &dest, asset.size, Some(&sha), &Stop::default(), &mut |_| {}).unwrap();
+        http.download(&asset.url, &dest, asset.size, &sha, &Stop::default(), &mut |_| {}).unwrap();
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), asset.size);
+    }
+
+    /// Answers one request with `head` (status line and headers) and an empty body.
+    fn answer_once(head: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/repos/storytold/photocraft/releases/latest", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let _ = write!(stream, "{head}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        url
+    }
+
+    #[test]
+    fn a_secondary_limit_waits_for_retry_after_not_the_hourly_reset() {
+        // GitHub's secondary limit: quota left, an hourly reset 50 minutes away, and "try again
+        // in a minute". That's a minute, not 50 minutes of "the hourly limit was reached".
+        let now = crate::now();
+        let url = answer_once(format!(
+            "HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 41\r\nx-ratelimit-reset: {}\r\nretry-after: 60\r\n",
+            now + 50 * 60
+        ));
+        let Fetched::RateLimited { reset: Some(until) } = Http::new().unwrap().get_api(&url, None).unwrap() else { panic!("not rate limited") };
+        assert!((now + 60..now + 120).contains(&until), "limited for {} s", until - now);
+    }
+
+    #[test]
+    fn an_empty_hourly_quota_waits_for_the_reset() {
+        let now = crate::now();
+        let reset = now + 31 * 60;
+        let url = answer_once(format!("HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\n"));
+        assert_eq!(Http::new().unwrap().get_api(&url, None).unwrap(), Fetched::RateLimited { reset: Some(reset) });
+    }
+
+    #[test]
+    fn github_refusals_are_read_the_way_github_documents_them() {
+        const NOW: i64 = 1_791_500_000;
+        // Out of quota: until the reset, or Retry-After if that's later.
+        assert_eq!(refused_until(403, Some("0"), Some(NOW + 1800), None, NOW), Some(Some(NOW + 1800)));
+        assert_eq!(refused_until(403, Some("0"), Some(NOW + 30), Some(90), NOW), Some(Some(NOW + 90)));
+        assert_eq!(refused_until(403, Some("0"), None, None, NOW), Some(None));
+        // A secondary limit: Retry-After, never the hourly reset.
+        assert_eq!(refused_until(429, Some("12"), Some(NOW + 1800), Some(30), NOW), Some(Some(NOW + 30)));
+        // A 429 that doesn't say: a minute.
+        assert_eq!(refused_until(429, Some("12"), Some(NOW + 1800), None, NOW), Some(Some(NOW + 60)));
+        // A plain 403 (blocked, private, …) isn't a rate limit.
+        assert_eq!(refused_until(403, Some("12"), Some(NOW + 1800), None, NOW), None);
+        assert_eq!(refused_until(403, None, None, None, NOW), None);
     }
 
     #[test]

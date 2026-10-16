@@ -21,7 +21,6 @@
 	Sort	排序
 	Suite order	默认顺序
 	Name	名称
-	Inspired by	参考软件
 	Status	状态
 	Installed version	已安装版本
 	Latest version	最新版本
@@ -59,6 +58,8 @@
 	ArtCraft Launcher {version} is available.	ArtCraft Launcher {version} 已可更新。
 	Dismiss	忽略
 	Update and restart	更新并重启
+	A new version is available. Would you like to relaunch with the updated version?	有新版本可用。是否使用更新后的版本重新启动？
+	Later	稍后
 	What's new	更新内容
 	No notes were published with this release.	此版本未提供更新说明。
 	Released {date}	发布于 {date}
@@ -66,9 +67,11 @@
 	Close	关闭
 	ArtCraft Launcher {version}	ArtCraft Launcher {version}
 	Only when I ask	仅手动检查
+	Automatically download and install updates	自动下载并安装更新
 	Notify me when an installed app has an update	已安装应用有更新时通知我
 	Include pre-releases (betas and release candidates)	包含预发布版本（测试版和候选版）
 	Installing on Linux	Linux 安装设置
+	Installing on Windows	Windows 安装设置
 	Install new apps as	新应用安装格式
 	System package (recommended)	系统软件包（推荐）
 	Updates always use the format an app was installed with.	更新时始终使用应用原来的安装格式。
@@ -106,6 +109,7 @@ month	Nov	11月
 month	Dec	12月
 	Not checked yet	尚未检查
 	GitHub's hourly limit was reached; full details return in {min} min	已达到 GitHub 每小时请求上限；{min} 分钟后可获取完整信息
+	GitHub limit hit; back in {min} min	已达 GitHub 限额；{min} 分钟后恢复
 	Installing for {platform}	安装平台：{platform}
 	Downloads for {platform}	下载平台：{platform}
 	No downloads for this system	此系统暂无可用下载
@@ -123,6 +127,7 @@ month	Dec	12月
 	{version} installed → {latest} released	已安装 {version} → 最新 {latest}
 	Version {version}	版本 {version}
 	{installed} installed · latest {latest}	已安装 {installed} · 最新 {latest}
+	Installed · latest {latest}	已安装 · 最新 {latest}
 	Version {version} installed	已安装版本 {version}
 	Version {latest}	版本 {latest}
 	No release published yet	尚未发布版本
@@ -136,7 +141,6 @@ month	Dec	12月
 	Descending	降序
 	Click to reverse the order	点击切换排序方向
 	Click to sort by this column	点击按此列排序
-	Like {name}	类似 {name}
 	{done} of {total}	{done} / {total}
 	Downloading	正在下载
 	Verifying checksum…	正在验证校验和…
@@ -146,7 +150,6 @@ month	Dec	12月
 	Checking for updates…	正在检查更新…
 	Downloads the new version, replaces this one and opens it again	下载新版本，替换当前版本并重新打开
 	Couldn't check for updates: {f}	无法检查更新：{f}
-	Website (coming soon)	网站（即将上线）
 	GitHub repository	GitHub 仓库
 	ArtCraft	ArtCraft
 	Update 1 app	更新 1 个应用
@@ -172,6 +175,7 @@ column	Installed	已安装版本
 column	Latest	最新版本
 column	Released	发布日期
 filter	Installed	已安装
+	{name} details	{name} 详情
 @plural	{n} min ago|{n} min ago	{n} 分钟前
 @plural	{n} h ago|{n} h ago	{n} 小时前
 @plural	{n} day ago|{n} days ago	{n} 天前
@@ -200,7 +204,6 @@ filter	Installed	已安装
 @id	filter.notinstalled	未安装
 @id	sort.suite	默认顺序
 @id	sort.name	名称
-@id	sort.inspired	参考软件
 @id	sort.status	状态
 @id	sort.installed	已安装版本
 @id	sort.latest	最新版本
@@ -245,6 +248,7 @@ deckcraft	Presentations and slide shows	演示文稿与幻灯片
 gridcraft	Spreadsheets and data	电子表格与数据处理
 cadcraft	Computer-aided design and drafting	计算机辅助设计与制图
 soundcraft	Recording, editing and mixing audio	音频录制、编辑与混音
+figcraft	Interface design and prototyping	界面设计与原型制作
 
 	Show in Files	在文件管理器中显示
 	Loading ArtCraft Launcher…	正在加载 ArtCraft Launcher…
@@ -261,6 +265,10 @@ soundcraft	Recording, editing and mixing audio	音频录制、编辑与混音
 	Apps on this computer	此电脑上的应用
 	Installed apps with a newer version	有新版本的已安装应用
 	Apps you can install	可安装的应用
+	Hide App	隐藏应用
+	Unhide App	取消隐藏应用
+	Hidden Apps	已隐藏的应用
+	Apps you hid	你隐藏的应用
 	Cancel update	取消更新
 	Stop waiting; the update can be started again later	停止等待；稍后可重新开始更新
 	Download again	重新下载
@@ -282,6 +290,19 @@ soundcraft	Recording, editing and mixing audio	音频录制、编辑与混音
 	RPM package (.rpm)	RPM 软件包 (.rpm)
 	Flatpak bundle	Flatpak 包
 	Tarball (.tar.gz)	压缩包 (.tar.gz)
+	App details	应用详情
+	Close (Esc)	关闭（Esc）
+	Features	功能特性
+	Latest release	最新发布
+	Version	版本
+	Platforms	平台
+	Releases	版本发布
+	Enlarge picture	放大图片
+	Click to enlarge	点击放大
+	Previous picture (←)	上一张（←）
+	Next picture (→)	下一张（→）
+	Loading pictures…	正在加载图片…
+	Pictures couldn't be loaded. Reopen this page to try again.	无法加载图片。重新打开此页面可重试。
 
 # Message templates (@msg): toasts from the backend. {placeholders} match any text.
 @msg	Couldn't open {name}: {e}	无法打开 {name}：{e}
@@ -292,3 +313,20 @@ soundcraft	Recording, editing and mixing audio	音频录制、编辑与混音
 @msg	{name} installed: {version} (this release publishes no checksum, so only its size was checked)	{name} 已安装：{version}（此版本未发布校验和，因此只检查了文件大小）
 @msg	{name} was removed	{name} 已卸载
 @msg	{name} is running. Quit it, then try again.	{name} 正在运行。请先退出，然后重试。
+	Install folder	安装文件夹
+	Default install folder	默认安装文件夹
+	System default	系统默认
+	Browse…	浏览…
+	Use default	使用默认
+	New installs use this folder. Updates stay in their current location.	新安装的应用使用此文件夹。更新时保留当前位置。
+	Custom folders use AppImage on Linux.	在 Linux 上，自定义文件夹使用 AppImage。
+	The system manages install locations here.	此环境中的安装位置由系统管理。
+@msg	couldn't use install folder {path}: {reason}	无法使用安装文件夹 {path}：{reason}
+@msg	this release has no AppImage for a custom install folder	此版本没有可用于自定义安装文件夹的 AppImage
+@msg	custom install folders aren't supported on this system	此系统不支持自定义安装文件夹
+@msg	{path} already exists and wasn't installed by ArtCraft Launcher	{path} 已存在，且并非由 ArtCraft Launcher 安装
+@msg	couldn't move {path} to Trash ({reason}). Remove it in Finder instead.	无法将 {path} 移到废纸篓（{reason}）。请在 Finder 中移除。
+	Apps are placed inside this folder.	应用会放置在此文件夹内。
+	Replace what's there?	替换现有内容？
+	{path} already exists. Installing {name} will overwrite it.	{path} 已存在。安装 {name} 将覆盖它。
+	Replace	替换

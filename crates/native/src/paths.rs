@@ -46,13 +46,33 @@ impl Paths {
         self.cache.join("feed-throttle.json")
     }
 
+    /// A picture of an app's details page, saved after its first download: under the revision of the
+    /// pictures repository it was fetched from, so a new revision never reads an old picture.
+    pub fn screenshot(&self, app: &str, key: &str) -> PathBuf {
+        self.cache.join("screenshots").join(artcraft_launcher_core::details::SCREENSHOTS_REV).join(app).join(format!("{key}.jpg"))
+    }
+
     pub fn manifest(&self) -> PathBuf {
         self.data.join("installed.json")
+    }
+
+    /// The launcher's own log files (`artcraft-launcher.log` and the previous runs').
+    pub fn logs(&self) -> PathBuf {
+        self.data.join("logs")
     }
 
     /// Where tarball installs (FreeBSD, Linux without AppImage) are unpacked: `<data>/apps/<app>`.
     pub fn apps(&self) -> PathBuf {
         self.data.join("apps")
+    }
+
+    /// The folder an app unpacked in [`Self::apps`] sees as its home: `<data>/apps/<app>/home`.
+    /// A Craft App keeps its settings in the XDG folders (`~/.config`, `~/.local/share`,
+    /// `~/.cache`), so pointing `HOME` and those variables here keeps every app's configuration
+    /// beside it, inside the folder the launcher owns.
+    #[cfg(target_os = "linux")]
+    pub fn app_home(&self, id: &str) -> PathBuf {
+        self.apps().join(id).join("home")
     }
 }
 

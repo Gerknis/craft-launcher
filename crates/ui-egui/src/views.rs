@@ -1,6 +1,7 @@
 //! The header, toolbar, footer, the grid of cards and the table, laid out like the apps page on
 //! getartcraft.com: hairline cells, mono labels and square controls.
 
+use artcraft_launcher_core::details::AppDetails;
 use artcraft_launcher_core::platform::pick_asset;
 use artcraft_launcher_core::protocol::{Command, JobPhase};
 use artcraft_launcher_core::status::AppStatus;
@@ -52,6 +53,8 @@ enum Primary {
 pub(crate) const HEADER_H: f32 = 48.0;
 /// Height of the footer bar.
 pub(crate) const FOOTER_H: f32 = 34.0;
+/// The footer drops its platform label rather than leave the status less room than this.
+const FOOTER_MIN_STATUS_W: f32 = 300.0;
 
 const CARD_MIN_W: f32 = 320.0;
 const CARD_H: f32 = 280.0;
@@ -60,9 +63,6 @@ const STRIP_H: f32 = 40.0;
 const CARD_PAD: f32 = 20.0;
 /// Room macOS's traffic lights take at the left of the header.
 const TRAFFIC_LIGHTS_W: f32 = 72.0;
-
-/// A run of cards, under an optional (number, title) eyebrow.
-type Section = (Option<(&'static str, &'static str)>, Vec<&'static str>);
 
 impl LauncherUi {
     /// The header bar; with a custom or macOS title bar it is also the window's title bar.
@@ -81,11 +81,6 @@ impl LauncherUi {
             let logo = vec2(14.0 * crate::icons::ARTCRAFT_LOGO_ASPECT, 14.0);
             let (cell, _) = ui.allocate_exact_size(vec2(logo.x + 40.0, h), Sense::hover());
             egui::Image::new(crate::icons::artcraft_logo(t.dark)).alt_text(tl!("ArtCraft")).paint_at(ui, Rect::from_center_size(cell.center(), logo));
-            widgets::rule(ui, h);
-            ui.add_space(16.0);
-            widgets::tag(ui, tl!("Launcher"), t.invert_bg, t.invert_fg);
-            ui.add_space(12.0);
-            widgets::hud(ui, tl!("Craft App Suite"), t.muted);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if bar == TitleBar::Custom {
                     widgets::window_buttons(ui, h);
@@ -113,13 +108,32 @@ impl LauncherUi {
                 }
                 ui.add_space(6.0);
                 widgets::rule(ui, h);
+                // The controls reserve their actual widths before the secondary text gets space.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let tag_width =
+                        widgets::caps(ui, tl!("Launcher"), theme::HUD_SIZE, theme::mono_bold(), theme::HUD_SPACING, t.ink).size().x + 16.0;
+                    if ui.available_width() >= 17.0 + tag_width {
+                        widgets::rule(ui, h);
+                        ui.add_space(16.0);
+                        widgets::tag(ui, tl!("Launcher"), t.invert_bg, t.invert_fg);
+                    }
+                    if ui.available_width() >= 12.0 + widgets::hud_galley(ui, tl!("Craft App Suite"), t.muted).size().x {
+                        ui.add_space(12.0);
+                        widgets::hud(ui, tl!("Craft App Suite"), t.muted);
+                    }
+                });
             });
         });
     }
 
     pub(crate) fn toolbar(&mut self, ui: &mut Ui) {
+        if self.settings.filter == Filter::Hidden && self.settings.hidden.is_empty() {
+            self.settings.filter = Filter::All;
+        }
         let t = Tokens::get(ui.ctx());
-        if let Some(r) = self.launcher_update.clone() {
+        if self.dialog.is_none()
+            && let Some(r) = self.launcher_update.clone()
+        {
             egui::Frame::new()
                 .fill(tint(t.accent, if t.dark { 0.10 } else { 0.07 }))
                 .stroke(Stroke::new(1.0, tint(t.accent, 0.6)))
@@ -170,7 +184,10 @@ impl LauncherUi {
                                     self.send(Command::UpdateLauncher);
                                 }
                             } else {
-                                let url = self.platform.and_then(|p| launcher_download(&r, p)).unwrap_or_else(|| r.html_url.clone());
+                                let url = self
+                                    .platform
+                                    .and_then(|p| launcher_download(&r, p, crate::settings::is_flatpak_sandbox()))
+                                    .unwrap_or_else(|| r.html_url.clone());
                                 if widgets::button(ui, tl!("Download"), Kind::Primary, 0.0).clicked() {
                                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                                 }
@@ -185,17 +202,19 @@ impl LauncherUi {
         self.announcements(ui);
         ui.horizontal(|ui| {
             let updates = self.count(Filter::Updates);
-            let filters: Vec<(Filter, Cell<'_>)> = [
+            let mut filters = vec![
                 (Filter::All, tl!("All"), tl!("Every Craft app"), None),
                 // The tab names a group ("installed ones"); the status pill says "Installed".
                 (Filter::Installed, tr_ctx(current(), "filter", "Installed"), tl!("Apps on this computer"), None),
                 (Filter::Updates, tl!("Updates"), tl!("Installed apps with a newer version"), Some(t.warn)),
                 (Filter::NotInstalled, tl!("Not installed"), tl!("Apps you can install"), None),
-            ]
-            .into_iter()
-            .filter(|(f, ..)| self.caps.manage_apps || *f == Filter::All)
-            .map(|(f, label, tip, highlight)| (f, Cell { label, tip, count: Some((self.count(f), highlight)) }))
-            .collect();
+            ];
+            filters.retain(|(f, ..)| self.caps.manage_apps || *f == Filter::All);
+            if !self.settings.hidden.is_empty() {
+                filters.push((Filter::Hidden, tl!("Hidden Apps"), tl!("Apps you hid"), None));
+            }
+            let filters: Vec<(Filter, Cell<'_>)> =
+                filters.into_iter().map(|(f, label, tip, highlight)| (f, Cell { label, tip, count: Some((self.count(f), highlight)) })).collect();
             widgets::cells(ui, &mut self.settings.filter, &filters);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.caps.manage_apps && updates > 0 {
@@ -205,12 +224,8 @@ impl LauncherUi {
                         fmt(tl!("Update all ({count})"), &[("count", &updates.to_string())])
                     };
                     if widgets::button(ui, &label, Kind::Primary, 0.0).clicked() {
-                        let ids: Vec<&str> = self
-                            .entries
-                            .iter()
-                            .filter(|e| e.status(self.platform, true) == AppStatus::UpdateAvailable && e.job.is_none())
-                            .map(|e| e.app.id)
-                            .collect();
+                        let ids: Vec<&str> =
+                            self.entries.iter().filter(|e| self.in_filter(e, Filter::Updates) && e.job.is_none()).map(|e| e.app.id).collect();
                         for id in ids {
                             self.send(Command::Install { app: id.to_string() });
                         }
@@ -230,15 +245,7 @@ impl LauncherUi {
                         .selected_text(RichText::new(sort_label(self.settings.sort)).size(13.0))
                         .width(140.0)
                         .show_ui(ui, |ui| {
-                            for key in [
-                                SortKey::Suite,
-                                SortKey::Name,
-                                SortKey::InspiredBy,
-                                SortKey::Status,
-                                SortKey::Installed,
-                                SortKey::Latest,
-                                SortKey::Released,
-                            ] {
+                            for key in [SortKey::Suite, SortKey::Name, SortKey::Status, SortKey::Installed, SortKey::Latest, SortKey::Released] {
                                 if ui.selectable_label(self.settings.sort == key, sort_label(key)).clicked() {
                                     self.settings.sort = key;
                                     self.settings.sort_descending = key.starts_descending();
@@ -289,51 +296,81 @@ impl LauncherUi {
     pub(crate) fn footer(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
         let now = self.backend.now();
-        ui.horizontal_centered(|ui| {
-            if self.checking {
-                widgets::hud(ui, tl!("Checking for updates…"), t.faint);
-            } else if let Some(at) = self.settings.last_check {
-                let ago = ago_text(at, now);
-                let text = match self.sources_label() {
-                    Some(using) => fmt(tl!("Checked {ago} · using {sources}"), &[("ago", &ago), ("sources", &using)]),
-                    None => fmt(tl!("Checked {ago}"), &[("ago", &ago)]),
-                };
-                widgets::hud(ui, &text, t.faint);
-            } else {
-                widgets::hud(ui, tl!("Not checked yet"), t.faint);
+        let status = if self.checking {
+            tl!("Checking for updates…").to_string()
+        } else if let Some(at) = self.settings.last_check {
+            let ago = ago_text(at, now);
+            match self.sources_label() {
+                Some(using) => fmt(tl!("Checked {ago} · using {sources}"), &[("ago", &ago), ("sources", &using)]),
+                None => fmt(tl!("Checked {ago}"), &[("ago", &ago)]),
             }
-            if let Some(until) = self.rate_limited_until.filter(|u| *u > now) {
-                ui.label(
-                    RichText::new(format!(
-                        "· {}",
-                        fmt(
-                            tl!("GitHub's hourly limit was reached; full details return in {min} min"),
-                            &[("min", &((until - now) / 60).max(1).to_string())]
-                        )
-                    ))
-                    .size(12.0)
-                    .color(t.warn),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = match self.platform {
-                    Some(p) if self.caps.manage_apps => fmt(tl!("Installing for {platform}"), &[("platform", &p.label())]),
-                    Some(p) => fmt(tl!("Downloads for {platform}"), &[("platform", &p.label())]),
-                    None => tl!("No downloads for this system").into(),
-                };
-                widgets::hud(ui, &label, t.faint);
+        } else {
+            tl!("Not checked yet").to_string()
+        };
+        // The full notice, and a short one for a narrow window.
+        let notice = self.rate_limited_until.filter(|u| *u > now).map(|until| {
+            let min = ((until - now) / 60).max(1).to_string();
+            let full = fmt(tl!("GitHub's hourly limit was reached; full details return in {min} min"), &[("min", &min)]);
+            let short = fmt(tl!("GitHub limit hit; back in {min} min"), &[("min", &min)]);
+            (format!("· {full}"), format!("· {short}"))
+        });
+        let platform = match self.platform {
+            Some(p) if self.caps.manage_apps => fmt(tl!("Installing for {platform}"), &[("platform", &p.label())]),
+            Some(p) => fmt(tl!("Downloads for {platform}"), &[("platform", &p.label())]),
+            None => tl!("No downloads for this system").into(),
+        };
+        use artcraft_launcher_core::catalog::{DISCORD_URL, GITHUB_URL, SOCIAL, WEBSITE_URL};
+        let links = [(tl!("Discord"), DISCORD_URL), (tl!("GitHub"), GITHUB_URL), (tl!("Website"), WEBSITE_URL)];
+        let (icon, link_gap) = (13.0, 16.0);
+        // The links and icons on the right keep their size; the status on the left gets what is
+        // left and is cut short with "…", never drawn under them. A narrow window drops the
+        // platform label first, so the status keeps room to be read.
+        let spacing = ui.spacing().item_spacing.x;
+        let links_w: f32 =
+            links.iter().map(|(text, _)| widgets::hud_galley(ui, &format!("{text} ↗"), t.muted).size().x + link_gap).sum::<f32>() - link_gap;
+        let icons_w = SOCIAL.len() as f32 * (icon + 8.0);
+        let platform_w = widgets::hud_galley(ui, &platform, t.faint).size().x + 16.0 + spacing;
+        let left_w = ui.available_width() - icons_w - 12.0 - links_w - 16.0 - 3.0 * spacing;
+        let show_platform = left_w - platform_w >= FOOTER_MIN_STATUS_W;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if show_platform {
+                widgets::hud(ui, &platform, t.faint);
                 ui.add_space(16.0);
-                // Right to left, so this reads: Website · GitHub · Discord, then the social icons.
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    widgets::social_icons(ui, 13.0);
+            }
+            // Right to left, so this reads: Website · GitHub · Discord, then the social icons.
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                widgets::social_icons(ui, icon);
+            });
+            ui.add_space(12.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = link_gap;
+                for (text, url) in links {
+                    widgets::hud_link(ui, text, url);
+                }
+            });
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // While GitHub is rate limited, saying so matters more than when we last checked.
+                let avail = ui.available_width();
+                let text = |s: &str| RichText::new(s).size(12.0).color(t.warn);
+                let width = |ui: &Ui, s: &str| {
+                    egui::WidgetText::from(text(s)).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x
+                        + spacing
+                };
+                // The short notice once the full one would leave the status under a third.
+                let notice = notice.map(|(full, short)| {
+                    let w = width(ui, &full);
+                    if w <= avail * 0.7 { (full, None, w) } else { (short.clone(), Some(full), width(ui, &short)) }
                 });
-                ui.add_space(12.0);
-                ui.spacing_mut().item_spacing.x = 16.0;
-                use artcraft_launcher_core::catalog::{DISCORD_URL, GITHUB_URL, WEBSITE_URL};
-                widgets::hud_link(ui, tl!("Discord"), DISCORD_URL);
-                widgets::hud_link(ui, tl!("GitHub"), GITHUB_URL);
-                widgets::hud_link(ui, tl!("Website"), WEBSITE_URL);
+                let notice_w = notice.as_ref().map_or(0.0, |(_, _, w)| *w);
+                widgets::hud_elided(ui, &status, t.faint, (avail - notice_w).max(avail * 0.3));
+                if let Some((shown, full, _)) = notice {
+                    let resp = ui.add(egui::Label::new(text(&shown)).truncate());
+                    if let Some(full) = full {
+                        resp.on_hover_text(full);
+                    }
+                }
             });
         });
     }
@@ -345,44 +382,15 @@ impl LauncherUi {
         // Neighbouring cards share their 1 px hairline, like the site's `gap-px` grid.
         let cols = ((width / CARD_MIN_W).floor() as usize).max(1);
         let card_w = (width + (cols as f32 - 1.0)) / cols as f32;
-        // In suite order, split into the classic apps and the new ones.
-        let grouped = self.settings.sort == SortKey::Suite && self.settings.filter == Filter::All && self.search.trim().is_empty();
-        let sections: Vec<Section> = if grouped {
-            [(AppGroup::Classic, "01", tl!("Classic apps")), (AppGroup::New, "02", tl!("New apps"))]
-                .iter()
-                .map(|(g, index, title)| {
-                    let list = ids.iter().copied().filter(|id| self.entry(id).is_some_and(|e| e.app.group == *g)).collect();
-                    (Some((*index, *title)), list)
-                })
-                .collect()
-        } else {
-            vec![(None, ids.to_vec())]
-        };
-        let t = Tokens::get(ui.ctx());
-        for (title, list) in sections {
-            if list.is_empty() {
-                continue;
-            }
-            if let Some((index, title)) = title {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    widgets::eyebrow(ui, index, title);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        widgets::hud(ui, &tn(list.len() as u64, "{n} app", "{n} apps"), t.faint);
-                    });
-                });
-                ui.add_space(10.0);
-            }
-            let rows = list.len().div_ceil(cols);
-            let height = rows as f32 * (CARD_H - 1.0) + 1.0;
-            let (area, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-            for (i, id) in list.iter().enumerate() {
-                let (row, col) = (i / cols, i % cols);
-                let min = area.min + vec2(col as f32 * (card_w - 1.0), row as f32 * (CARD_H - 1.0));
-                self.card(ui, id, Rect::from_min_size(min, vec2(card_w, CARD_H)));
-            }
-            ui.add_space(24.0);
+        let rows = ids.len().div_ceil(cols);
+        let height = rows as f32 * (CARD_H - 1.0) + 1.0;
+        let (area, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        for (i, id) in ids.iter().enumerate() {
+            let (row, col) = (i / cols, i % cols);
+            let min = area.min + vec2(col as f32 * (card_w - 1.0), row as f32 * (CARD_H - 1.0));
+            self.card(ui, id, Rect::from_min_size(min, vec2(card_w, CARD_H)));
         }
+        ui.add_space(24.0);
     }
 
     fn card(&mut self, ui: &mut Ui, id: &str, rect: Rect) {
@@ -390,13 +398,27 @@ impl LauncherUi {
         let t = Tokens::get(ui.ctx());
         let app = entry.app;
         let hovered = ui.rect_contains_pointer(rect);
-        let lift = ui.ctx().animate_bool_with_time(ui.id().with(("card-hover", id)), hovered, 0.3);
+        let wipe = if self.reduce_motion { 0.0 } else { 0.3 };
+        let lift = ui.ctx().animate_bool_with_time(ui.id().with(("card-hover", id)), hovered, wipe);
         let app_color = rgb(app.color);
+        // The whole card opens the app's page. Added before the card's own links and buttons, so
+        // they sit on top of it and keep their clicks.
+        if AppDetails::by_id(id).is_some() {
+            let open = ui.interact(rect, ui.id().with(("card-open", id)), Sense::click());
+            open.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, fmt(tl!("{name} details"), &[("name", app.name)])));
+            if open.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.detail = Some(id.to_string());
+            }
+        }
         let painter = ui.painter_at(rect.expand(16.0));
-        painter.rect(rect, CornerRadius::ZERO, t.bg, t.hairline(), egui::StrokeKind::Inside);
-        // On hover, a 2 px rule in the app's colour wipes in from the left along the top.
+        // A faint wash in the app's colour fades in under the pointer.
+        let fill = t.bg.lerp_to_gamma(app_color, 0.05 * lift);
+        painter.rect(rect, CornerRadius::ZERO, fill, t.hairline(), egui::StrokeKind::Inside);
+        // On hover, a 2 px rule in the app's colour wipes in from the left along the top, inside the
+        // hairlines the card shares with its neighbours (the site's rule sits within its grid gaps).
         if lift > 0.0 {
-            painter.rect_filled(Rect::from_min_size(rect.min, vec2(rect.width() * lift, 2.0)), CornerRadius::ZERO, app_color);
+            let inside = rect.shrink(1.0);
+            painter.rect_filled(Rect::from_min_size(inside.min, vec2(inside.width() * lift, 2.0)), CornerRadius::ZERO, app_color);
         }
 
         // The top strip: the app's number in its colour, and its pages.
@@ -411,9 +433,7 @@ impl LauncherUi {
             strip_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
                 widgets::hud_link(ui, tl!("GitHub"), &app.repo_url());
-                if let Some(site) = app.website() {
-                    widgets::hud_link(ui, tl!("Website"), &site);
-                }
+                widgets::hud_link(ui, tl!("Website"), &app.website());
             });
         }
 
@@ -425,10 +445,10 @@ impl LauncherUi {
         let ui = &mut child;
         ui.horizontal(|ui| {
             const ICON: f32 = 56.0;
-            let [name, tagline, like] = [FontId::new(22.0, theme::display()), FontId::proportional(13.5), FontId::proportional(12.0)];
+            let [name, tagline] = [FontId::new(22.0, theme::display()), FontId::proportional(13.5)];
             const GAP: f32 = 4.0;
             // The slot is as tall as the text beside it when that is taller, so the two share a centre.
-            let block = lines_height(ui, &[&name, &tagline, &like], GAP);
+            let block = lines_height(ui, &[&name, &tagline], GAP);
             let (slot, icon_response) = ui.allocate_exact_size(vec2(ICON, block.max(ICON)), Sense::hover());
             icon_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, fmt(tl!("{name} icon"), &[("name", app.name)])));
             // The icon rises a little on hover, over a soft drop shadow (the site's only shadow).
@@ -441,7 +461,7 @@ impl LauncherUi {
                 egui::Image::new(icon).paint_at(ui, icon_rect);
             }
             ui.add_space(6.0);
-            centered_lines(ui, &[&name, &tagline, &like], GAP, |ui| {
+            centered_lines(ui, &[&name, &tagline], GAP, |ui| {
                 // The name's row is as tall as its text, not as a button.
                 ui.spacing_mut().interact_size.y = 0.0;
                 ui.horizontal(|ui| {
@@ -451,10 +471,6 @@ impl LauncherUi {
                     }
                 });
                 ui.add(egui::Label::new(RichText::new(tr_ctx(current(), app.id, app.tagline)).font(tagline.clone()).color(t.muted)).truncate());
-                ui.add(
-                    egui::Label::new(RichText::new(fmt(tl!("Like {name}"), &[("name", &app.inspired_by())])).font(like.clone()).color(t.faint))
-                        .truncate(),
-                );
             });
         });
         ui.add_space(14.0);
@@ -499,7 +515,6 @@ impl LauncherUi {
                 .vscroll(false)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::remainder().at_least(220.0).clip(true))
-                .column(Column::exact(172.0).clip(true))
                 .column(Column::exact(176.0))
                 .column(Column::exact(84.0))
                 .column(Column::exact(84.0))
@@ -508,7 +523,6 @@ impl LauncherUi {
                 .header(42.0, |mut header| {
                     for (key, label) in [
                         (Some(SortKey::Name), tl!("App")),
-                        (Some(SortKey::InspiredBy), tl!("Inspired by")),
                         (Some(SortKey::Status), tl!("Status")),
                         (Some(SortKey::Installed), tr_ctx(current(), "column", "Installed")),
                         (Some(SortKey::Latest), tr_ctx(current(), "column", "Latest")),
@@ -563,6 +577,20 @@ impl LauncherUi {
                                 if i < last {
                                     rule(ui);
                                 }
+                                // Clicking the app's cell opens its page (the content is added after, so it wins any hit).
+                                if AppDetails::by_id(id).is_some() {
+                                    let open = ui.interact(ui.max_rect(), ui.id().with(("row-open", id)), Sense::click());
+                                    open.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            fmt(tl!("{name} details"), &[("name", entry.app.name)]),
+                                        )
+                                    });
+                                    if open.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        self.detail = Some(id.to_string());
+                                    }
+                                }
                                 if let Some(icon) = crate::icons::app(entry.app.id) {
                                     ui.add(egui::Image::new(icon).fit_to_exact_size(vec2(38.0, 38.0)));
                                 }
@@ -581,9 +609,6 @@ impl LauncherUi {
                                         .truncate(),
                                     );
                                 });
-                            });
-                            row.col(|ui| {
-                                ui.add(egui::Label::new(RichText::new(entry.app.inspired_by()).size(13.0).color(t.muted)).truncate());
                             });
                             row.col(|ui| {
                                 let (text, tone) = model::entry_status_text(&entry, &status, self.caps.manage_apps);
@@ -625,13 +650,6 @@ impl LauncherUi {
         }
     }
 
-    /// The trademark notice under the grid and the table.
-    pub(crate) fn trademark_notice(&self, ui: &mut Ui) {
-        let t = Tokens::get(ui.ctx());
-        ui.add_space(8.0);
-        ui.add(egui::Label::new(RichText::new(artcraft_launcher_core::catalog::TRADEMARK_NOTICE).size(11.0).color(t.faint)).wrap());
-    }
-
     // ---- actions -------------------------------------------------------------------------
 
     fn primary_action(&self, entry: &AppEntry, status: &AppStatus) -> Primary {
@@ -663,7 +681,13 @@ impl LauncherUi {
     }
 
     /// The main button (or progress) and the … menu, within `width`.
-    fn actions(&mut self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, width: f32) {
+    pub(crate) fn actions(&mut self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, width: f32) {
+        self.actions_in(ui, entry, status, width, true);
+    }
+
+    /// The main button and the `⋯` menu beside it. `links_in_menu` is false where the page shows
+    /// the website, GitHub and releases links as buttons of its own.
+    pub(crate) fn actions_in(&mut self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, width: f32, links_in_menu: bool) {
         let t = Tokens::get(ui.ctx());
         let id = entry.app.id.to_string();
         // One square button (the menu) beside the main one.
@@ -741,29 +765,29 @@ impl LauncherUi {
                 fmt(tl!("{done} downloaded"), &[("done", &widgets::human_bytes(p.done))])
             };
             if resp.on_hover_text(tip).clicked() {
-                self.send(Command::Install { app: id.clone() });
+                self.install_app(&id);
             }
             if widgets::glyph_button(ui, widgets::Glyph::Close, tl!("Discard download")).clicked() {
                 self.send(Command::Cancel { app: id.clone() });
             }
-            self.menu(ui, entry, status);
+            self.menu(ui, entry, status, links_in_menu);
             return;
         }
         match self.primary_action(entry, status) {
             Primary::Install => {
                 if widgets::button(ui, tl!("Install"), Kind::Primary, main_w).clicked() {
-                    self.send(Command::Install { app: id.clone() });
+                    self.install_app(&id);
                 }
             }
             Primary::Retry(label) => {
                 let tip = tl!("The download is still here. It's checked again, then installed.");
                 if widgets::button(ui, &label, Kind::Primary, main_w).on_hover_text(tip).clicked() {
-                    self.send(Command::Install { app: id.clone() });
+                    self.install_app(&id);
                 }
             }
             Primary::Update(v) => {
                 if widgets::button(ui, &fmt(tl!("Update to {v}"), &[("v", &v)]), Kind::Primary, main_w).clicked() {
-                    self.send(Command::Install { app: id.clone() });
+                    self.install_app(&id);
                 }
             }
             Primary::Open => {
@@ -784,10 +808,10 @@ impl LauncherUi {
                 ui.add_enabled_ui(false, |ui| widgets::button(ui, label, Kind::Secondary, main_w));
             }
         }
-        self.menu(ui, entry, status);
+        self.menu(ui, entry, status, links_in_menu);
     }
 
-    fn menu(&mut self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus) {
+    fn menu(&mut self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, links: bool) {
         let id = entry.app.id.to_string();
         let manage = self.caps.manage_apps;
         let reveal = self.caps.reveal_label;
@@ -801,7 +825,7 @@ impl LauncherUi {
                 manage && entry.ready && entry.paused.is_none() && matches!(status, AppStatus::Available | AppStatus::UpdateAvailable);
             if can_download_again && ui.button(tl!("Download again")).clicked() {
                 self.send(Command::Cancel { app: id.clone() });
-                self.send(Command::Install { app: id.clone() });
+                self.install_app(&id);
                 ui.close();
             }
             if manage && status.is_installed() {
@@ -814,7 +838,7 @@ impl LauncherUi {
                     ui.close();
                 }
                 if *status == AppStatus::UpToDate && ui.button(tl!("Reinstall")).clicked() {
-                    self.send(Command::Install { app: id.clone() });
+                    self.install_app(&id);
                     ui.close();
                 }
                 ui.separator();
@@ -843,21 +867,32 @@ impl LauncherUi {
                     }
                 }
             }
-            ui.separator();
-            let link = |ui: &mut Ui, label: &str, url: String| {
-                if ui.button(label).clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    ui.close();
-                }
-            };
-            match entry.app.website() {
-                Some(site) => link(ui, tl!("Website"), site),
-                None => {
-                    ui.add_enabled(false, egui::Button::new(tl!("Website (coming soon)")));
-                }
+            // The drawer shows the links as buttons, so its menu leaves them out (but keeps Hide).
+            if links {
+                ui.separator();
+                let link = |ui: &mut Ui, label: &str, url: String| {
+                    if ui.button(label).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        ui.close();
+                    }
+                };
+                link(ui, tl!("Website"), entry.app.website());
+                link(ui, tl!("GitHub repository"), entry.app.repo_url());
+                link(ui, tl!("All releases"), entry.app.releases_url());
             }
-            link(ui, tl!("GitHub repository"), entry.app.repo_url());
-            link(ui, tl!("All releases"), entry.app.releases_url());
+            ui.separator();
+            let hidden = self.settings.hidden.contains(entry.app.id);
+            if ui.button(if hidden { tl!("Unhide App") } else { tl!("Hide App") }).clicked() {
+                if hidden {
+                    self.settings.hidden.remove(entry.app.id);
+                    if self.settings.hidden.is_empty() && self.settings.filter == Filter::Hidden {
+                        self.settings.filter = Filter::All;
+                    }
+                } else {
+                    self.settings.hidden.insert(id);
+                }
+                ui.close();
+            }
         });
     }
 }
@@ -866,7 +901,6 @@ fn sort_label(k: SortKey) -> &'static str {
     match k {
         SortKey::Suite => tl!("Suite order"),
         SortKey::Name => tl!("Name"),
-        SortKey::InspiredBy => tl!("Inspired by"),
         SortKey::Status => tl!("Status"),
         SortKey::Installed => tl!("Installed version"),
         SortKey::Latest => tl!("Latest version"),
@@ -875,25 +909,32 @@ fn sort_label(k: SortKey) -> &'static str {
 }
 
 /// "0.4.1 installed → 0.5.0 released · Oct 8, 2026" and friends.
-fn version_line(e: &AppEntry, status: &AppStatus) -> String {
+pub(crate) fn version_line(e: &AppEntry, status: &AppStatus) -> String {
     let released = e.release().and_then(|r| r.published_at).map(|at| format!(" · {}", date_text(at))).unwrap_or_default();
-    match (status, e.installed_label(), e.latest_label()) {
+    let inst_ver = e.installed.as_ref().and_then(|i| i.version.as_ref().map(ToString::to_string));
+    let latest = e.latest_label();
+    match (status, inst_ver.as_deref(), latest.as_deref()) {
         (AppStatus::UpdateAvailable, Some(i), Some(l)) => {
-            format!("{}{released}", fmt(tl!("{version} installed → {latest} released"), &[("version", i.as_str()), ("latest", l.as_str())]))
+            format!("{}{released}", fmt(tl!("{version} installed → {latest} released"), &[("version", i), ("latest", l)]))
         }
-        (AppStatus::UpToDate, Some(i), _) => format!("{}{released}", fmt(tl!("Version {version}"), &[("version", i.as_str())])),
-        (_, Some(i), Some(l)) => fmt(tl!("{installed} installed · latest {latest}"), &[("installed", i.as_str()), ("latest", l.as_str())]),
-        (_, Some(i), None) => fmt(tl!("Version {version} installed"), &[("version", i.as_str())]),
-        (_, None, Some(l)) => format!("{}{released}", fmt(tl!("Version {latest}"), &[("latest", l.as_str())])),
+        (AppStatus::UpToDate, Some(i), _) => format!("{}{released}", fmt(tl!("Version {version}"), &[("version", i)])),
+        (_, Some(i), Some(l)) => fmt(tl!("{installed} installed · latest {latest}"), &[("installed", i), ("latest", l)]),
+        (_, None, Some(l)) if e.installed.is_some() => fmt(tl!("Installed · latest {latest}"), &[("latest", l)]),
+        (_, Some(i), None) => fmt(tl!("Version {version} installed"), &[("version", i)]),
+        (_, None, None) if e.installed.is_some() => tl!("Installed").to_string(),
+        (_, None, Some(l)) => format!("{}{released}", fmt(tl!("Version {latest}"), &[("latest", l)])),
         (AppStatus::NoRelease, None, None) => tl!("No release published yet").to_string(),
         _ => " ".to_string(),
     }
 }
 
-/// The launcher's own download for this platform.
-fn launcher_download(r: &artcraft_launcher_core::Release, p: artcraft_launcher_core::Platform) -> Option<String> {
+/// The launcher's own download for this platform. `flatpak` is whether this copy runs as a
+/// Flatpak; such a copy's download stays the `.flatpak` bundle — offering it an AppImage (or a
+/// `.deb`) would point at replacing the sandboxed install with a different one.
+pub(crate) fn launcher_download(r: &artcraft_launcher_core::Release, p: artcraft_launcher_core::Platform, flatpak: bool) -> Option<String> {
     use artcraft_launcher_core::PackageKind;
     let kinds: &[PackageKind] = match p.os {
+        artcraft_launcher_core::Os::Linux if flatpak => &[PackageKind::Flatpak],
         artcraft_launcher_core::Os::Linux => &[PackageKind::AppImage, PackageKind::Deb],
         _ => p.default_kinds(),
     };
@@ -915,4 +956,45 @@ fn centered_lines(ui: &mut Ui, fonts: &[&FontId], gap: f32, add_contents: impl F
 fn lines_height(ui: &Ui, fonts: &[&FontId], gap: f32) -> f32 {
     let line = |font: &FontId| ui.fonts_mut(|f| f.layout_no_wrap(String::new(), font.clone(), Color32::PLACEHOLDER)).size().y;
     (fonts.iter().map(|font| line(font) + gap).sum::<f32>() - gap).max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use artcraft_launcher_core::catalog::LAUNCHER_ID;
+    use artcraft_launcher_core::{Arch, Asset, Platform, Release};
+
+    fn release() -> Release {
+        let asset = |name: &str| Asset { name: name.into(), size: 0, url: format!("https://dl.example/{name}"), sha256: None };
+        Release {
+            tag: "v0.4.1".into(),
+            version: None,
+            name: "ArtCraft Launcher v0.4.1".into(),
+            published_at: None,
+            html_url: "https://github.com/storytold/craft-launcher/releases/tag/v0.4.1".into(),
+            notes: String::new(),
+            prerelease: false,
+            assets: vec![
+                asset(&format!("{LAUNCHER_ID}-0.4.1-linux-x86_64.flatpak")),
+                asset(&format!("{LAUNCHER_ID}-0.4.1-linux-x86_64.AppImage")),
+                asset(&format!("{LAUNCHER_ID}-0.4.1-linux-x86_64.deb")),
+            ],
+        }
+    }
+
+    fn platform() -> Platform {
+        Platform { os: artcraft_launcher_core::Os::Linux, arch: Arch::X64 }
+    }
+
+    #[test]
+    fn a_flatpak_copy_of_the_launcher_gets_the_bundle() {
+        let url = launcher_download(&release(), platform(), true).unwrap();
+        assert_eq!(url, format!("https://dl.example/{LAUNCHER_ID}-0.4.1-linux-x86_64.flatpak"));
+    }
+
+    #[test]
+    fn a_plain_linux_copy_still_gets_the_appimage() {
+        let url = launcher_download(&release(), platform(), false).unwrap();
+        assert_eq!(url, format!("https://dl.example/{LAUNCHER_ID}-0.4.1-linux-x86_64.AppImage"));
+    }
 }

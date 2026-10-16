@@ -5,6 +5,7 @@
 
 mod icns;
 mod ico;
+mod local;
 mod version;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,9 @@ commands:
                   pack square PNGs (<= 256 px) into a Windows .ico (see packaging/icons.sh)
   icns <out.icns> <in.png>...
                   pack square PNGs (16-1024 px) into a macOS .icns, on any OS
+  local sync | serve | status
+                  build the Craft apps from their checkouts and install them from this machine
+                  (cargo xtask local help)
 ";
 
 /// Packages that must build for wasm32-unknown-unknown: the pure core and the web app (which
@@ -37,6 +41,7 @@ fn main() -> ExitCode {
         Some("version") => version::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("icns") => icns::run(&rest),
+        Some("local") => local::run(&rest),
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
             Ok(())

@@ -19,10 +19,12 @@ macro_rules! tl {
 mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod cjk_font;
+mod details;
 mod dialogs;
 pub mod i18n;
 pub mod icons;
 pub mod model;
+mod motion;
 mod notes;
 pub mod settings;
 pub mod theme;

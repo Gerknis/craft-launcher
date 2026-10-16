@@ -5,13 +5,18 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod logging;
+mod motion;
 mod settings_file;
 #[cfg(target_os = "macos")]
 mod spaces;
+#[cfg(target_os = "linux")]
+mod system_theme;
 mod tray;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -29,7 +34,9 @@ const SETTINGS_KEY: &str = "settings";
 type Wake = Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>;
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // First, so the panic report and every start-up warning are recorded (`logging`).
+    let logs = logging::install();
+    logging::install_panic_hook();
     // Detect system language in the background so the first frame can use it.
     artcraft_launcher_ui_egui::i18n::detect_system_lang_in_background();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,20 +47,48 @@ fn main() -> ExitCode {
     let mut hidden = args.iter().any(|a| a == login::HIDDEN_FLAG);
 
     let wake: Wake = Arc::new(OnceLock::new());
-    let show_requests = match single_instance::claim(wake.clone()) {
+    let starts = match single_instance::claim(wake.clone()) {
         Instance::Secondary => return ExitCode::SUCCESS,
         Instance::Primary(rx) => rx,
     };
+    // The log file lives in the launcher's data folder (beside the executable in portable mode);
+    // opened after the arguments (so `--version` leaves no file behind) and once this is the only
+    // launcher running, so a second start doesn't rotate away the running one's log. Records
+    // logged until now are written to it first.
+    if let Some(logs) = logs {
+        match artcraft_launcher_native::paths::Paths::new() {
+            Ok(paths) => match logs.attach_dir(&paths.logs()) {
+                Ok(path) => log::info!("ArtCraft Launcher {}, log file {}", env!("CARGO_PKG_VERSION"), path.display()),
+                Err(e) => {
+                    logs.no_file();
+                    log::warn!("no log file: {e}");
+                }
+            },
+            Err(e) => {
+                logs.no_file();
+                log::warn!("no log file: {e}");
+            }
+        }
+    }
     let (tray_loop, woken) = sync_channel(1);
-    let waker = Arc::new(Waker { window: Mutex::new(None), tray_loop });
+    let waker = Arc::new(Waker { window: Mutex::new(None), tray_loop, quit_pending: AtomicBool::new(false) });
     {
         let waker = waker.clone();
         let _ = wake.set(Box::new(move || waker.wake()));
     }
 
+    // The desktop's animation setting comes over D-Bus: ask now, so the answer is in by the first frame.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = motion::reduced();
+
     let backend_waker = waker.clone();
     let settings_path = settings_file::path(APP_ID);
-    let mut launcher = Launcher::new(Box::new(NativeBackend::new(move || backend_waker.wake())), show_requests, settings_path.clone());
+    let mut launcher = Launcher::new(Box::new(NativeBackend::new(move || backend_waker.wake())), starts, settings_path.clone());
+    #[cfg(target_os = "linux")]
+    {
+        let theme_waker = waker.clone();
+        launcher.system_theme = system_theme::Monitor::start(move || theme_waker.wake());
+    }
     // Started hidden at login where a window can't hide: start in the tray without mapping one,
     // so no window flashes up. Without a tray to come back from, the window opens after all.
     let mut window = true;
@@ -109,7 +144,12 @@ fn native_options(hidden: bool) -> eframe::NativeOptions {
     } else {
         viewport.with_decorations(false)
     };
-    if let Some(icon) = icon {
+    // On macOS the bundle's .icns is the icon. Any icon given to eframe (its egui logo when none
+    // is) replaces it in the Dock at runtime with a raw bitmap, which skips the system's icon
+    // treatment, so pass the empty icon, which eframe takes as "leave it alone".
+    if cfg!(target_os = "macos") {
+        viewport = viewport.with_icon(egui::IconData::default());
+    } else if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
     eframe::NativeOptions { viewport, persist_window: true, wgpu_options: wgpu_options(), ..Default::default() }
@@ -119,18 +159,104 @@ fn native_options(hidden: bool) -> eframe::NativeOptions {
 /// Vulkan goes through vendor ICDs and third-party overlay layers, and on hybrid AMD laptops whose
 /// integrated and discrete GPUs run different driver packages (common on OEM machines, where the
 /// Adrenalin installer leaves the integrated GPU on the OEM driver) it crashes inside
-/// `amdvlk64.dll` before the first frame. `WGPU_BACKEND` still overrides the default.
+/// `amdvlk64.dll` before the first frame. `WGPU_BACKEND` still overrides the default, and then
+/// wgpu picks the adapter itself. Direct3D 12 shaders compile with FXC ([`pin_dx12_compiler`]).
+///
+/// Direct3D 12 presents through DirectComposition rather than straight to the window. The
+/// borderless window's drop shadow moves its client area down a pixel, and a swapchain made from
+/// the window is then stretched over it vertically by the compositor, blurring every horizontal
+/// edge and line of text. `WGPU_DX12_PRESENTATION_SYSTEM` still overrides it.
 #[cfg(windows)]
 fn wgpu_options() -> eframe::WgpuConfiguration {
-    use eframe::wgpu::Backends;
+    use eframe::wgpu::{Backends, Dx12Compiler, Dx12SwapchainKind, PowerPreference};
     let mut config = eframe::WgpuConfiguration::default();
+    pin_dx12_compiler(&mut config, Dx12Compiler::from_env());
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
-        setup.instance_descriptor.backends = Backends::from_env().unwrap_or(Backends::DX12 | Backends::GL);
+        setup.instance_descriptor.backend_options.dx12.presentation_system =
+            Dx12SwapchainKind::from_env().unwrap_or(Dx12SwapchainKind::DxgiFromVisual);
+        if let Some(backends) = Backends::from_env() {
+            setup.instance_descriptor.backends = backends;
+        } else {
+            setup.instance_descriptor.backends = Backends::DX12 | Backends::GL;
+            let integrated = setup.power_preference == PowerPreference::LowPower;
+            setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
+                adapters
+                    .iter()
+                    .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+                    .min_by_key(|a| {
+                        let info = a.get_info();
+                        adapter_rank(info.backend, info.device_type, integrated)
+                    })
+                    .cloned()
+                    .ok_or_else(|| "no graphics adapter can draw to the window".to_owned())
+            }));
+        }
     }
     config
 }
 
-#[cfg(not(windows))]
+/// Compiles Direct3D 12 shaders with FXC (`d3dcompiler_47.dll`, part of Windows) unless
+/// `env_choice` (normally `Dx12Compiler::from_env()`, i.e. `WGPU_DX12_COMPILER`) names another.
+/// wgpu's default (`Auto`) loads whichever `dxcompiler.dll` the DLL search path finds. The launcher
+/// ships none, and without a matching `dxil.dll` DXC warns that the DXIL is unsigned; wgpu takes
+/// the warning for a compile error, its indirect-validation pipeline fails, the device is lost
+/// and the launcher exits before the first frame (#126).
+#[cfg(any(windows, test))]
+fn pin_dx12_compiler(config: &mut eframe::WgpuConfiguration, env_choice: Option<eframe::wgpu::Dx12Compiler>) {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        setup.instance_descriptor.backend_options.dx12.shader_compiler = env_choice.unwrap_or(eframe::wgpu::Dx12Compiler::Fxc);
+    }
+}
+
+/// wgpu's own adapter order (by device type, then enumeration order), except that any Direct3D 12
+/// adapter, the WARP software one included, comes before GL. wgpu ranks WARP last, so on GPUs with
+/// no D3D12 driver (Intel HD 4000, Radeon TeraScale) it picked the GL one, whose legacy driver
+/// failed `Surface::configure` and wgpu panicked before the window opened.
+#[cfg(any(windows, test))]
+fn adapter_rank(backend: eframe::wgpu::Backend, device_type: eframe::wgpu::DeviceType, integrated: bool) -> (bool, u8) {
+    use eframe::wgpu::{Backend, DeviceType};
+    let device = match device_type {
+        DeviceType::DiscreteGpu => 1 + u8::from(integrated),
+        DeviceType::IntegratedGpu => 2 - u8::from(integrated),
+        DeviceType::Other => 3,
+        DeviceType::VirtualGpu => 4,
+        DeviceType::Cpu => 5,
+    };
+    (backend != Backend::Dx12, device)
+}
+
+/// wgpu's adapter on Linux and the BSDs: the GPU the desktop runs on. egui asks for the
+/// high-performance GPU, which on a hybrid laptop in PRIME on-demand mode is the discrete one while
+/// the display server runs on the integrated one: every frame then crosses between the GPUs, and
+/// while the window is resized it shows stale or garbled frames and can stop drawing (issue #69).
+/// With no preference wgpu takes the first adapter Vulkan lists, and Mesa's device-select layer
+/// lists the display server's GPU first (or the one `DRI_PRIME` picks). Without that layer the
+/// order follows the ICD files, where lavapipe (`lvp_icd`) can sort before the real driver, so a
+/// software rasterizer only wins when nothing else can draw. `WGPU_POWER_PREF` (`low`, `high` or
+/// `none`) still overrides it, and then wgpu picks the adapter itself.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn wgpu_options() -> eframe::WgpuConfiguration {
+    use eframe::wgpu::{DeviceType, PowerPreference};
+    let mut config = eframe::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        if let Some(preference) = PowerPreference::from_env() {
+            setup.power_preference = preference;
+        } else {
+            setup.power_preference = PowerPreference::None;
+            setup.native_adapter_selector = Some(Arc::new(|adapters, surface| {
+                adapters
+                    .iter()
+                    .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+                    .min_by_key(|a| a.get_info().device_type == DeviceType::Cpu)
+                    .cloned()
+                    .ok_or_else(|| "no graphics adapter can draw to the window".to_owned())
+            }));
+        }
+    }
+    config
+}
+
+#[cfg(target_os = "macos")]
 fn wgpu_options() -> eframe::WgpuConfiguration {
     eframe::WgpuConfiguration::default()
 }
@@ -139,7 +265,12 @@ fn wgpu_options() -> eframe::WgpuConfiguration {
 struct Waker {
     window: Mutex<Option<egui::Context>>,
     tray_loop: SyncSender<()>,
+    /// Quit was picked in the tray and no tick has taken it up yet.
+    quit_pending: AtomicBool,
 }
+
+/// How long a tray Quit may wait for the window to take it up before the launcher exits anyway.
+const QUIT_GRACE: Duration = Duration::from_secs(2);
 
 impl Waker {
     fn wake(&self) {
@@ -147,6 +278,30 @@ impl Waker {
             ctx.request_repaint();
         }
         let _ = self.tray_loop.try_send(());
+    }
+
+    /// Quit was picked in the tray. A minimized window may get no frames at all (Wayland sends none),
+    /// so the quit would wait until the window is restored: if no tick has taken it up in time, exit.
+    fn quit_from_tray(self: &Arc<Self>) {
+        self.quit_pending.store(true, Ordering::SeqCst);
+        let waker = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(QUIT_GRACE);
+            if waker.quit_unseen() {
+                log::warn!("the window did not answer a quit from the tray: exiting");
+                std::process::exit(0);
+            }
+        });
+    }
+
+    /// A tick took up the quit.
+    fn quit_seen(&self) {
+        self.quit_pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a quit from the tray is still waiting (and no longer is).
+    fn quit_unseen(&self) -> bool {
+        self.quit_pending.swap(false, Ordering::SeqCst)
     }
 
     fn set_window(&self, ctx: Option<egui::Context>) {
@@ -218,6 +373,21 @@ fn no_window() -> egui::RawInput {
     egui::RawInput { focused: false, viewports: std::iter::once((egui::ViewportId::ROOT, viewport)).collect(), ..Default::default() }
 }
 
+/// macOS sends notifications on behalf of a bundle id. When none is set, the library looks up an app named
+/// "use_default" and macOS asks the user "Where is use_default?". Set ours before the first notification.
+/// The library accepts only one call (even a failed one skips that lookup), so the first outcome is kept and logged once.
+#[cfg(target_os = "macos")]
+fn claim_notification_identity() -> &'static Result<(), String> {
+    static CLAIMED: OnceLock<Result<(), String>> = OnceLock::new();
+    CLAIMED.get_or_init(|| {
+        let claimed = notify_rust::set_application(APP_ID).map_err(|e| e.to_string());
+        if let Err(e) = &claimed {
+            log::warn!("notification identity {APP_ID}: {e}");
+        }
+        claimed
+    })
+}
+
 struct DesktopHost {
     tray: bool,
     quit: bool,
@@ -232,6 +402,8 @@ impl Host for DesktopHost {
         let (title, body) = (title.to_string(), body.to_string());
         // Some platforms block while the notification is delivered.
         std::thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            claim_notification_identity();
             let mut n = notify_rust::Notification::new();
             n.summary(&title).body(&body).appname("ArtCraft Launcher");
             #[cfg(windows)]
@@ -260,6 +432,18 @@ impl Host for DesktopHost {
         login::set_enabled(on)
     }
 
+    fn pick_folder(&mut self, initial: Option<&str>) -> Option<String> {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(folder) = initial.filter(|p| std::path::Path::new(p).is_dir()) {
+            dialog = dialog.set_directory(folder);
+        }
+        dialog.pick_folder().and_then(|p| p.to_str().map(str::to_string))
+    }
+
+    fn reduce_motion(&self) -> bool {
+        motion::reduced()
+    }
+
     fn quit(&mut self) {
         self.quit = true;
     }
@@ -268,10 +452,13 @@ impl Host for DesktopHost {
 /// Everything that outlives a window: the UI state and its backend, the tray icon, and the work
 /// that goes on with or without a window.
 struct Launcher {
+    #[cfg(target_os = "linux")]
+    system_theme: system_theme::Monitor,
     ui: LauncherUi,
     tray: Option<tray::Tray>,
     host: DesktopHost,
-    show_requests: Receiver<()>,
+    /// Requests from later starts of the launcher.
+    starts: Receiver<single_instance::Request>,
     /// Stands in for a window's context while only the tray exists. A window can't reuse it: a
     /// new window's renderer has none of the textures a used context has already handed out.
     windowless: egui::Context,
@@ -283,25 +470,29 @@ struct Launcher {
     closed_to_tray: bool,
     /// eframe's settings file, which the launcher writes itself while there is no window.
     settings_path: Option<PathBuf>,
+    waker: Option<Arc<Waker>>,
 }
 
 impl Launcher {
-    fn new(backend: Box<dyn Backend>, show_requests: Receiver<()>, settings_path: Option<PathBuf>) -> Self {
+    fn new(backend: Box<dyn Backend>, starts: Receiver<single_instance::Request>, settings_path: Option<PathBuf>) -> Self {
         let windowless = egui::Context::default();
         let (asked, run_again) = channel();
         windowless.set_request_repaint_callback(move |info| {
             let _ = asked.send(info.delay);
         });
         Self {
+            #[cfg(target_os = "linux")]
+            system_theme: system_theme::Monitor::default(),
             ui: LauncherUi::new(&windowless, backend, Settings::default()),
             tray: None,
             host: DesktopHost { tray: false, quit: false },
-            show_requests,
+            starts,
             windowless,
             run_again,
             started: false,
             closed_to_tray: false,
             settings_path,
+            waker: None,
         }
     }
 
@@ -312,8 +503,9 @@ impl Launcher {
         if let Some(settings) = settings {
             self.ui.settings = settings;
         }
-        let waker = waker.clone();
-        match tray::Tray::new(move || waker.wake()) {
+        self.waker = Some(waker.clone());
+        let (wake, on_quit) = (waker.clone(), waker.clone());
+        match tray::Tray::new(move || wake.wake(), move || on_quit.quit_from_tray()) {
             Ok(t) => self.tray = Some(t),
             Err(e) => log::warn!("no tray icon: {e}"),
         }
@@ -342,7 +534,11 @@ impl Launcher {
     fn tick(&mut self, ctx: &egui::Context) -> Vec<Request> {
         self.ui.logic(ctx, &mut self.host);
         let mut requests = Vec::new();
-        if self.show_requests.try_iter().count() > 0 {
+        let starts: Vec<single_instance::Request> = self.starts.try_iter().collect();
+        if starts.contains(&single_instance::Request::Replace) && !self.ui.busy() {
+            // A newer launcher is starting and takes over once this one has quit.
+            requests.push(Request::Quit);
+        } else if !starts.is_empty() {
             requests.push(Request::Show);
         }
         let actions = self.tray.as_ref().map(tray::Tray::actions).unwrap_or_default();
@@ -357,7 +553,12 @@ impl Launcher {
                         log::warn!("couldn't open {url}: {e}");
                     }
                 }
-                tray::TrayAction::Quit => requests.push(Request::Quit),
+                tray::TrayAction::Quit => {
+                    if let Some(waker) = &self.waker {
+                        waker.quit_seen();
+                    }
+                    requests.push(Request::Quit);
+                }
             }
         }
         if let Some(t) = self.tray.as_mut() {
@@ -513,6 +714,12 @@ impl eframe::App for Shell<'_> {
         self.launcher.ui.ui(ui, &mut self.launcher.host);
     }
 
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        #[cfg(target_os = "linux")]
+        self.launcher.system_theme.apply(raw_input);
+        self.launcher.ui.raw_input(ctx, raw_input);
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SETTINGS_KEY, &self.launcher.ui.settings);
     }
@@ -535,6 +742,15 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_791_500_000;
+
+    /// The bundle id is set once: asking again gives the first outcome, not the library's "already set" error.
+    /// (Setting it fails where the launcher is not installed, so the outcome itself is not asserted.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notification_identity_is_claimed_once() {
+        let first = claim_notification_identity();
+        assert_eq!(claim_notification_identity(), first);
+    }
 
     /// What the tests can see of a [`Quiet`] backend, and its clock.
     #[derive(Default)]
@@ -571,7 +787,7 @@ mod tests {
     }
 
     /// A launcher with no tray and no window, the sender of its show requests, and its backend's record.
-    fn launcher() -> (Launcher, Sender<()>, Arc<Seen>) {
+    fn launcher() -> (Launcher, Sender<single_instance::Request>, Arc<Seen>) {
         let seen = Arc::new(Seen { clock: AtomicI64::new(NOW), ..Seen::default() });
         let (show, show_requests) = channel();
         (Launcher::new(Box::new(Quiet(seen.clone())), show_requests, None), show, seen)
@@ -643,7 +859,7 @@ mod tests {
     fn with_no_window_a_show_request_opens_one() {
         let (mut launcher, show, _) = launcher();
         let (_wake, woken) = sync_channel(1);
-        assert!(show.send(()).is_ok());
+        assert!(show.send(single_instance::Request::Show).is_ok());
         assert!(launcher.wait_in_tray(&woken));
     }
 
@@ -651,7 +867,7 @@ mod tests {
     fn with_no_window_quit_wins_over_a_show_request() {
         let (mut launcher, show, _) = launcher();
         let (_wake, woken) = sync_channel(1);
-        assert!(show.send(()).is_ok());
+        assert!(show.send(single_instance::Request::Show).is_ok());
         launcher.host.quit();
         assert!(!launcher.wait_in_tray(&woken));
     }
@@ -665,7 +881,7 @@ mod tests {
         let pause = Duration::from_millis(200);
         let waking = std::thread::spawn(move || {
             std::thread::sleep(pause);
-            let _ = show.send(());
+            let _ = show.send(single_instance::Request::Show);
             let _ = wake.try_send(());
         });
         let started = Instant::now();
@@ -735,6 +951,17 @@ mod tests {
     }
 
     #[test]
+    fn a_tray_quit_nobody_took_up_ends_the_launcher() {
+        let (tray_loop, _woken) = sync_channel(1);
+        let waker = Waker { window: Mutex::new(None), tray_loop, quit_pending: AtomicBool::new(true) };
+        assert!(waker.quit_unseen());
+        assert!(!waker.quit_unseen());
+        waker.quit_pending.store(true, Ordering::SeqCst);
+        waker.quit_seen();
+        assert!(!waker.quit_unseen());
+    }
+
+    #[test]
     fn quitting_overrides_a_close_to_the_tray() {
         let (mut launcher, _show, _) = launcher();
         let ctx = launcher.windowless.clone();
@@ -753,5 +980,53 @@ mod tests {
         shell.put_away(&ctx);
         assert!(!shell.visible);
         assert!(!shell.launcher.closed_to_tray);
+    }
+
+    #[test]
+    fn dx12_shaders_compile_with_fxc_unless_asked() {
+        use eframe::egui_wgpu::WgpuSetup;
+        use eframe::wgpu::Dx12Compiler;
+        fn compiler(env_choice: Option<Dx12Compiler>) -> Dx12Compiler {
+            let mut config = eframe::WgpuConfiguration::default();
+            if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+                // wgpu's default: whichever dxcompiler.dll the DLL search path finds (#126).
+                setup.instance_descriptor.backend_options.dx12.shader_compiler = Dx12Compiler::Auto;
+            }
+            pin_dx12_compiler(&mut config, env_choice);
+            match config.wgpu_setup {
+                WgpuSetup::CreateNew(setup) => setup.instance_descriptor.backend_options.dx12.shader_compiler,
+                WgpuSetup::Existing(_) => panic!("the default configuration creates its own instance"),
+            }
+        }
+        assert!(matches!(compiler(None), Dx12Compiler::Fxc));
+        assert!(matches!(compiler(Some(Dx12Compiler::Auto)), Dx12Compiler::Auto));
+        assert!(matches!(compiler(Some(Dx12Compiler::default_dynamic_dxc())), Dx12Compiler::DynamicDxc { .. }));
+    }
+
+    #[test]
+    fn warp_beats_a_gl_gpu_but_not_a_d3d12_gpu() {
+        use eframe::wgpu::{Backend, DeviceType};
+        // Intel HD 4000 + Radeon HD 7600M have no D3D12 driver; their GL one fails to configure.
+        let warp = adapter_rank(Backend::Dx12, DeviceType::Cpu, false);
+        assert!(warp < adapter_rank(Backend::Gl, DeviceType::IntegratedGpu, false));
+        assert!(warp < adapter_rank(Backend::Gl, DeviceType::Other, false));
+        // Hardware D3D12 still wins, in wgpu's order for the power preference.
+        let (discrete, integrated) = (DeviceType::DiscreteGpu, DeviceType::IntegratedGpu);
+        assert!(adapter_rank(Backend::Dx12, integrated, false) < warp);
+        assert!(adapter_rank(Backend::Dx12, discrete, false) < adapter_rank(Backend::Dx12, integrated, false));
+        assert!(adapter_rank(Backend::Dx12, integrated, true) < adapter_rank(Backend::Dx12, discrete, true));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn linux_draws_on_the_desktops_gpu_unless_told_otherwise() {
+        use eframe::wgpu::PowerPreference;
+        let config = wgpu_options();
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &config.wgpu_setup else {
+            panic!("the launcher creates its own wgpu instance");
+        };
+        // egui would ask for the discrete GPU: on a PRIME laptop that's not the desktop's (issue #69).
+        let expected = PowerPreference::from_env().unwrap_or(PowerPreference::None);
+        assert_eq!(setup.power_preference, expected);
     }
 }

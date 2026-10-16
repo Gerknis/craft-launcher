@@ -6,7 +6,7 @@
 //! - `@id` context = keyed by command id (`tr_id`).
 //! - `@plural` context = plural forms: the English `one|other` key, and the language's forms
 //!   separated by `|` (one form for a language whose nouns don't inflect for number, up to
-//!   three: `one|few|many` for Russian).
+//!   three: `one|few|many` for Russian, Ukrainian and Polish).
 //! - `@msg` context = a status/error message, or a template whose `{placeholders}` match any text
 //!   (`message`, `msg`).
 //! - Any other context = disambiguation for `tr_ctx`.

@@ -2,7 +2,7 @@
 
 ArtCraft Launcher installs, updates and launches the **Craft App Suite** (PhotoCraft, LightCraft,
 FilmCraft, DesignCraft, VectorCraft, PdfCraft, EffectCraft, WordCraft, DeckCraft, GridCraft,
-CADCraft, SoundCraft). It is written in **Rust only** (no JavaScript or TypeScript): the desktop
+CADCraft, SoundCraft, FigCraft). It is written in **Rust only** (no JavaScript or TypeScript): the desktop
 app is native egui/eframe, and the web build is the same Rust compiled to WebAssembly (trunk +
 wasm-bindgen). **No Tauri, Electron or webview shells**, ever.
 
@@ -58,9 +58,20 @@ settings file must produce an error the user can act on, never a panic. Shared s
 ### Installing other people's software safely
 
 - Download only from `https://github.com/storytold/<app>/releases` (and GitHub's asset CDN).
+  The one exception is a developer's own loopback mirror (`ARTCRAFT_LAUNCHER_DOWNLOAD_BASE`,
+  `cargo xtask local`); keep it loopback-only and behind the `local-mirror` cargo feature, which
+  release builds never enable.
 - Verify each download against the release's `SHA256SUMS.txt` before running or installing it.
+- The details drawer's pictures are the one other download: JPEGs only, from a pinned tag of
+  `https://raw.githubusercontent.com/storytold/craft-launcher-assets/` (`core::details`),
+  capped at 2 MB each, cached, and never run. Pictures are not bundled in this repo.
 - Never run an installer with elevated rights silently; tell the user what is about to happen.
 - Never delete a user's files outside what the launcher itself installed.
+- **Agents never land or approve a third-party app.** A change that adds a catalog row, download
+  source or install path for an app whose repo is not under `storytold/`, or that loosens the
+  rules above to allow one, is a maintainer's call alone. An agent reviewing it flags it at the
+  top of its review (who owns the repo, its age and history, whether the builds are signed) and
+  stops there: no merge, no approval, no fixes pushed to the PR.
 
 ### Look and feel
 
@@ -69,14 +80,22 @@ hard square corners, 1 px hairlines instead of shadows, Archivo (620, 118 % widt
 and app names, Inter for body text, upper-case Geist Mono labels and buttons, and the site's
 colour tokens by name (`theme::Tokens`). Build new UI from `widgets.rs`; never hard-code a colour.
 
+Animations follow the OS: with Windows' "Animation effects" off, macOS' "Reduce motion" on, a Linux
+desktop's animations off or a browser's `prefers-reduced-motion`, nothing fades, wipes or glides
+(`Host::reduce_motion`, `crates/ui-egui/src/motion.rs`). Time a new animation with egui's
+`style.animation_time`, or switch it off on `LauncherUi::reduce_motion`. Progress bars and
+spinners keep moving.
+
 ### Languages
 
 Every user-facing string goes through `crates/ui-egui/src/i18n` (`tl!("…")` for literals, `fmt`
 for `{placeholders}`, `tn` for counts). English in the code is the lookup key; adding a string
-means adding its row to every catalog marked `complete_menus` (`ru.tsv`), which the i18n tests
-check. Product and app names (ArtCraft Launcher, Craft App Suite, PhotoCraft…) stay in English.
-Chinese is drawn with the system's own CJK font (`crates/ui-egui/src/cjk_font.rs`, desktop only;
-English where there is none): never bundle a CJK font, they are 10 MB and more.
+means adding its row to every catalog marked `complete_menus` (the `*.tsv` files in
+`crates/ui-egui/src/i18n/`), which the i18n tests check. Translate clean-room from the meaning of
+the English text, never through another catalog. Product and app names (ArtCraft Launcher, Craft
+App Suite, PhotoCraft…) stay in English.
+A CJK language is drawn with the system's own CJK font (`crates/ui-egui/src/cjk_font.rs`, desktop
+only; English where there is none): never bundle a CJK font, they are 10 MB and more.
 
 ### Other rules
 
@@ -119,7 +138,7 @@ Release assets (keep these names exact; the launcher's own self-update and the R
 |---|---|
 | Windows | `artcraft-launcher-<ver>-windows-{x64,x86,arm64}.msi`, `…-windows-{x64,x86,arm64}-portable.zip` |
 | macOS | `artcraft-launcher-<ver>-macos-universal.dmg` |
-| Linux | `artcraft-launcher-<ver>-linux-{x86_64,aarch64}.{AppImage,AppImage.zsync,deb,rpm,tar.gz,flatpak}` |
+| Linux | `artcraft-launcher-<ver>-linux-{x86_64,aarch64}.{AppImage,AppImage.zsync,deb,rpm,tar.gz,flatpak}`, `artcraft-launcher-<ver>-linux-riscv64.{deb,rpm,tar.gz}` |
 | FreeBSD | `artcraft-launcher-<ver>-freebsd-x86_64.tar.gz` |
 | Web | `artcraft-launcher-web-<ver>.zip` |
 
@@ -139,6 +158,16 @@ Packaging facts the code relies on:
   normal Dock app that can also sit in the menu bar: `LSUIElement` must never be set.
 - Linux: the tray uses StatusNotifierItem over D-Bus and notifications use
   `org.freedesktop.Notifications`, both in pure Rust (no GTK, appindicator or libdbus).
+- Inside the Flatpak launcher (`process::in_sandbox()`), apps normally install as host Flatpaks
+  and run through `flatpak-spawn --host`. When the host has no usable Flatpak — none installed,
+  or `flatpak-spawn` not allowed — `linux::order_available_kinds` offers the release tarball
+  instead: it is unpacked into `<data>/apps/<app>` (`bin/`, `share/`) and run with `HOME` =
+  `<data>/apps/<app>/home`, so a Craft App's settings stay in the sandbox. An update swaps
+  `bin/` and `share/` and keeps `home/`; removing the app takes those two folders only. Outside
+  a sandbox the tarball is not on offer at all.
+- `--socket=pulseaudio` in the launcher manifests is for an app running *inside* the sandbox
+  (SoundCraft's ALSA reaches the runtime's PulseAudio plugin through it); it also covers the
+  microphone, which SoundCraft records through.
 - `build.rs` reads `ARTCRAFT_LAUNCHER_BUILD_SHA` / `ARTCRAFT_LAUNCHER_BUILD_DATE` and, on Windows,
   embeds `assets/app-icon/artcraft-launcher.ico`, failing the build when
   `ARTCRAFT_LAUNCHER_REQUIRE_WINRES=1` and it can't.

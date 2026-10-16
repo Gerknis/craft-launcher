@@ -112,10 +112,13 @@ if /usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist" >/
   exit 1
 fi
 
-# Integrity first: this must hold even for ad-hoc builds. Not --strict here: files read back from
-# the DMG's HFS volume (hdiutil makehybrid) report a com.apple.FinderInfo attribute, which strict
-# mode calls "detritus". package.sh already ran the strict check on the bundle before imaging it.
-codesign --verify --deep --verbose=2 "$APP"
+# Integrity first: this must hold even for ad-hoc builds, and with --strict, on the app in the
+# image and on a copy installed from it with ditto. A valid DMG signature says nothing about the
+# bundle inside: the old makehybrid image gave every file a com.apple.FinderInfo, which strict
+# mode rejects as "detritus".
+codesign --verify --strict --deep --verbose=2 "$APP"
+ditto "$APP" "$WORK/copy/$APP_NAME.app"
+codesign --verify --strict --deep --verbose=2 "$WORK/copy/$APP_NAME.app"
 details="$(codesign -d --verbose=2 "$APP" 2>&1)"
 printf '%s\n' "$details" | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier)[= ]' || true
 

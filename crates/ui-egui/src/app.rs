@@ -11,6 +11,7 @@ use artcraft_launcher_core::{Platform, SUITE};
 
 use crate::i18n::set_current;
 use crate::model::AppEntry;
+use crate::motion;
 use crate::settings::{Filter, Settings, SortKey, ViewMode};
 use crate::theme::{self, Tokens};
 
@@ -52,6 +53,14 @@ pub trait Host {
     fn set_login_item(&mut self, _on: bool) -> Result<(), String> {
         Err("not supported here".into())
     }
+    /// The OS asks for fewer animations (Windows' "Animation effects" switched off, macOS'
+    /// "Reduce motion"). Asked about once a second while the window draws, so it must be quick.
+    fn reduce_motion(&self) -> bool {
+        false
+    }
+    fn pick_folder(&mut self, _initial: Option<&str>) -> Option<String> {
+        None
+    }
     /// Quit the launcher for real (not just hide to the tray).
     fn quit(&mut self) {}
 }
@@ -66,7 +75,25 @@ pub(crate) struct Toast {
 pub(crate) enum Dialog {
     Notes(String),
     ConfirmUninstall(String),
+    Install { app: String, folder: String },
+    Replace { app: String, path: String },
     Settings,
+    LauncherUpdate(artcraft_launcher_core::Release),
+}
+
+impl Dialog {
+    /// What sets this dialog apart from the others, for egui's memory: each one keeps its own
+    /// size there, so a small prompt never opens at the height of the last dialog shown (#88).
+    pub(crate) fn key(&self) -> (&'static str, &str) {
+        match self {
+            Dialog::Notes(id) => ("notes", id),
+            Dialog::ConfirmUninstall(id) => ("uninstall", id),
+            Dialog::Install { app, .. } => ("install", app),
+            Dialog::Replace { app, .. } => ("replace", app),
+            Dialog::Settings => ("settings", ""),
+            Dialog::LauncherUpdate(r) => ("launcher-update", &r.tag),
+        }
+    }
 }
 
 pub struct LauncherUi {
@@ -90,27 +117,46 @@ pub struct LauncherUi {
     pub(crate) search: String,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) dialog: Option<Dialog>,
+    /// The app whose details drawer is open (or closing: see `detail_shown`).
+    pub(crate) detail: Option<String>,
+    /// The app the drawer is drawn for: it outlives `detail` while the drawer slides out.
+    pub(crate) detail_shown: Option<String>,
+    /// Which screenshot the drawer shows.
+    pub(crate) detail_shot: usize,
+    /// The screenshot is enlarged over the whole window.
+    pub(crate) detail_zoom: bool,
+    /// The details pictures the backend has sent (or been asked for), by app and picture key.
+    pub(crate) pictures: std::collections::HashMap<(String, String), crate::details::Picture>,
     started: bool,
     applied_theme: Option<theme::ThemeChoice>,
+    /// The OS asks for fewer animations: what the host last said, and the context's time to ask
+    /// it again at.
+    pub(crate) reduce_motion: bool,
+    motion_recheck: f64,
+    /// What the context's styles were last set for.
+    applied_motion: Option<bool>,
     /// Fonts registered with `set_fonts` only exist from the next frame on; drawing with the named
     /// weights before then would abort.
     fonts_ready: bool,
-    /// Whether the installed fonts include the system's Chinese font. Added the first time Chinese
-    /// is the language in use, then kept for the session.
-    cjk_fonts: bool,
+    /// The CJK language whose system font is installed, if any.
+    /// Set when such a language comes into use, then kept for the session.
+    pub(crate) cjk_font: Option<crate::i18n::Lang>,
     sent_options: Option<BackendOptions>,
     /// Unix seconds of the last look at what's installed (startup counts).
     last_detect: i64,
     /// Whether the window had focus last frame, to re-check when the user comes back to it.
     was_focused: bool,
+    /// Versions of apps or the launcher already queued for auto-update during this session,
+    /// preventing repeated install loops if an update fails or is in progress.
+    pub(crate) auto_update_attempted: std::collections::BTreeSet<(String, String)>,
 }
 
-/// The language to draw in: the preference, or English where it needs a Chinese font the system
+/// The language to draw in: the preference, or English where it needs a CJK font the system
 /// doesn't have (Settings says so), rather than boxes for every character. The only place the
-/// Chinese font gets loaded: when Chinese is selected, or Auto resolves to it.
+/// CJK font gets loaded: when such a language is selected, or Auto resolves to it.
 pub(crate) fn effective_lang(pref: &str) -> crate::i18n::Lang {
     let lang = crate::i18n::Lang::from_pref(pref);
-    if lang.needs_cjk_font() && !theme::cjk_font_available() { crate::i18n::Lang::EN } else { lang }
+    if lang.needs_cjk_font() && !theme::cjk_font_available(lang) { crate::i18n::Lang::EN } else { lang }
 }
 
 /// How often to look again at what's installed, to notice apps installed or removed outside
@@ -121,8 +167,9 @@ const RESCAN_ON_FOCUS_AFTER: i64 = 30;
 
 impl LauncherUi {
     pub fn new(ctx: &egui::Context, backend: Box<dyn Backend>, settings: Settings) -> Self {
-        let cjk_fonts = effective_lang(&settings.language).needs_cjk_font();
-        theme::install_fonts(ctx, cjk_fonts);
+        let lang = effective_lang(&settings.language);
+        let cjk_font = lang.needs_cjk_font().then_some(lang);
+        theme::install_fonts(ctx, cjk_font);
         egui_extras::install_image_loaders(ctx);
         let caps = backend.capabilities();
         let platform = backend.platform();
@@ -143,33 +190,61 @@ impl LauncherUi {
             search: String::new(),
             toasts: Vec::new(),
             dialog: None,
+            detail: None,
+            detail_shown: None,
+            detail_shot: 0,
+            detail_zoom: false,
+            pictures: std::collections::HashMap::new(),
             started: false,
             applied_theme: None,
+            reduce_motion: false,
+            motion_recheck: 0.0,
+            applied_motion: None,
             fonts_ready: false,
-            cjk_fonts,
+            cjk_font,
             sent_options: None,
             last_detect: 0,
             was_focused: true,
+            auto_update_attempted: std::collections::BTreeSet::new(),
         }
     }
 
-    /// Moves the UI to another window's context: fonts, image loaders and the theme belong to a
-    /// context, and toasts are timed on its clock.
+    /// Moves the UI to another window's context: fonts, image loaders, the theme and the animation
+    /// timings belong to a context, and toasts and the next look at the OS's animation setting are
+    /// timed on its clock.
     pub fn attach(&mut self, ctx: &egui::Context) {
-        theme::install_fonts(ctx, self.cjk_fonts);
+        theme::install_fonts(ctx, self.cjk_font);
         egui_extras::install_image_loaders(ctx);
         self.fonts_ready = false;
         self.applied_theme = None;
+        self.applied_motion = None;
+        self.motion_recheck = 0.0;
         self.toasts.clear();
     }
 
-    /// Installed apps with an update waiting (the tray shows the count).
+    /// Input on its way to egui (the shell's `raw_input_hook`): with fewer animations asked for,
+    /// a mouse wheel scrolls at once instead of gliding.
+    pub fn raw_input(&self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.reduce_motion {
+            motion::unsmooth_wheel(ctx, raw);
+        }
+    }
+
+    /// Installed apps with an update waiting (the tray shows the count). Hidden apps are left out,
+    /// so the badge matches the Updates list.
     pub fn update_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.status(self.platform, self.caps.manage_apps) == AppStatus::UpdateAvailable).count()
+        self.entries.iter().filter(|e| self.in_filter(e, Filter::Updates)).count()
+    }
+
+    /// Something is downloading or installing, the launcher's own update included: quitting now
+    /// would cut it short.
+    pub fn busy(&self) -> bool {
+        self.launcher_job.is_some() || self.entries.iter().any(|e| e.job.is_some())
     }
 
     /// Looks for updates now (the tray's "Check for Updates").
     pub fn check_now(&mut self) {
+        self.auto_update_attempted.clear();
         self.backend.send(Command::CheckForUpdates { force: true });
         self.backend.send(Command::Detect);
         self.last_detect = self.backend.now();
@@ -195,14 +270,39 @@ impl LauncherUi {
         self.entries.iter_mut().find(|e| e.app.id == id)
     }
 
-    /// Non-drawing work: runs every frame and also while the window is hidden in the tray.
-    pub fn logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
-        set_current(crate::i18n::Lang::from_pref(&self.settings.language));
-        let options = BackendOptions { kinds: self.settings.preferred_kinds.clone(), prereleases: self.settings.prereleases };
+    pub(crate) fn configure(&mut self) {
+        let options = BackendOptions {
+            kinds: self.settings.preferred_kinds.clone(),
+            prereleases: self.settings.prereleases,
+            install_locations: self.settings.install_locations.clone(),
+        };
         if self.sent_options.as_ref() != Some(&options) {
             self.backend.send(Command::Configure(options.clone()));
             self.sent_options = Some(options);
         }
+    }
+
+    pub(crate) fn custom_install_folders(&self) -> bool {
+        self.caps.manage_apps
+            && self.platform.is_some_and(|p| {
+                matches!(p.os, artcraft_launcher_core::Os::Windows | artcraft_launcher_core::Os::MacOs | artcraft_launcher_core::Os::Linux)
+            })
+            && !crate::settings::is_flatpak_sandbox()
+    }
+
+    pub(crate) fn install_app(&mut self, id: &str) {
+        if !self.custom_install_folders() || self.entry(id).is_some_and(|e| e.installed.is_some()) {
+            self.send(Command::Install { app: id.to_string() });
+            return;
+        }
+        self.dialog =
+            Some(Dialog::Install { app: id.to_string(), folder: self.settings.install_locations.per_app.get(id).cloned().unwrap_or_default() });
+    }
+
+    /// Non-drawing work: runs every frame and also while the window is hidden in the tray.
+    pub fn logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
+        set_current(crate::i18n::Lang::from_pref(&self.settings.language));
+        self.configure();
         if !self.started {
             self.started = true;
             self.backend.send(Command::CheckForUpdates { force: false });
@@ -231,6 +331,9 @@ impl LauncherUi {
         }
         if changed {
             self.announce_updates(host);
+            if self.settings.auto_update {
+                self.trigger_auto_updates();
+            }
         }
         if self.restart_requested {
             // The helper is waiting for this process to exit before it starts the new launcher.
@@ -254,6 +357,10 @@ impl LauncherUi {
                 }
                 true
             }
+            Event::Screenshot { app, key, result } => {
+                self.pictures.insert((app, key), crate::details::Picture::from_result(result));
+                true
+            }
             Event::Detected { app, installed } => {
                 if let Some(e) = self.entry_mut(&app) {
                     e.installed = installed;
@@ -264,6 +371,9 @@ impl LauncherUi {
             Event::Progress { app, phase } => {
                 if app == artcraft_launcher_core::catalog::LAUNCHER_ID {
                     self.launcher_job = Some(phase);
+                    if matches!(self.dialog, Some(Dialog::LauncherUpdate(_))) {
+                        self.dialog = None;
+                    }
                 } else if let Some(e) = self.entry_mut(&app) {
                     e.job = Some(phase);
                 }
@@ -290,6 +400,10 @@ impl LauncherUi {
                 }
                 false
             }
+            Event::Occupied { app, path } => {
+                self.dialog = Some(Dialog::Replace { app, path });
+                false
+            }
             Event::JobFinished { app, result } => {
                 let launcher = app == artcraft_launcher_core::catalog::LAUNCHER_ID;
                 // What the job was doing when it ended says what a cancellation called off.
@@ -313,13 +427,21 @@ impl LauncherUi {
                         self.toast(ctx, tl!("Install cancelled. The download is kept for the next try."), false);
                     }
                     Err(e) if e == INSTALL_CANCELLED => self.toast(ctx, tl!("Install cancelled"), false),
+                    // The Replace dialog says it all.
+                    Err(_) if matches!(&self.dialog, Some(Dialog::Replace { app: a, .. }) if *a == app) => {}
                     Err(e) => self.toast(ctx, e, true),
                 }
                 true
             }
             Event::LauncherUpdate(r) => {
-                self.launcher_update = Some(r);
-                false
+                let fresh = self.launcher_update.as_ref().is_none_or(|cur| cur.version != r.version);
+                self.launcher_update = Some(r.clone());
+                // Ask once per new version, unless automatic updates will install it anyway.
+                let automatic = self.settings.auto_update && self.caps.self_update;
+                if fresh && !automatic && self.dialog.is_none() && self.launcher_job.is_none() {
+                    self.dialog = Some(Dialog::LauncherUpdate(r));
+                }
+                fresh
             }
             Event::CheckStarted => {
                 self.checking = true;
@@ -339,7 +461,7 @@ impl LauncherUi {
     fn announce_updates(&mut self, host: &mut dyn Host) {
         let mut fresh = Vec::new();
         for e in &self.entries {
-            if e.status(self.platform, self.caps.manage_apps) != AppStatus::UpdateAvailable {
+            if !self.in_filter(e, Filter::Updates) {
                 continue;
             }
             let Some(v) = e.latest_label() else { continue };
@@ -368,16 +490,49 @@ impl LauncherUi {
         }
     }
 
+    /// When auto-updates are enabled, automatically downloads and installs pending updates.
+    pub(crate) fn trigger_auto_updates(&mut self) {
+        if !self.caps.manage_apps || !self.settings.auto_update {
+            return;
+        }
+        let to_update: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| self.in_filter(e, Filter::Updates) && e.job.is_none() && !e.ready)
+            .filter_map(|e| {
+                let v = e.latest_label()?;
+                if self.auto_update_attempted.contains(&(e.app.id.to_string(), v.clone())) { None } else { Some((e.app.id.to_string(), v)) }
+            })
+            .collect();
+        for (id, version) in to_update {
+            log::info!("auto-update: queuing update for {id} to {version}");
+            self.auto_update_attempted.insert((id.clone(), version));
+            self.send(Command::Install { app: id });
+        }
+        if self.caps.self_update
+            && let Some(r) = &self.launcher_update
+            && self.launcher_job.is_none()
+        {
+            let id = artcraft_launcher_core::catalog::LAUNCHER_ID.to_string();
+            let v = r.version_label();
+            if !self.auto_update_attempted.contains(&(id.clone(), v.clone())) {
+                log::info!("auto-update: queuing launcher self-update to {v}");
+                self.auto_update_attempted.insert((id, v));
+                self.send(Command::UpdateLauncher);
+            }
+        }
+    }
+
     /// Draws the launcher.
     pub fn ui(&mut self, ui: &mut egui::Ui, host: &mut dyn Host) {
         let ctx = ui.ctx().clone();
         // Set the current language for this frame based on settings.
         let lang = effective_lang(&self.settings.language);
         set_current(lang);
-        // `effective_lang` only picks Chinese once its font has loaded.
-        if lang.needs_cjk_font() && !self.cjk_fonts {
-            theme::install_fonts(&ctx, true);
-            self.cjk_fonts = true;
+        // `effective_lang` only picks a CJK language once its font has loaded.
+        if lang.needs_cjk_font() && self.cjk_font != Some(lang) {
+            theme::install_fonts(&ctx, Some(lang));
+            self.cjk_font = Some(lang);
             self.fonts_ready = false;
         }
         if !self.fonts_ready {
@@ -388,6 +543,15 @@ impl LauncherUi {
         if self.applied_theme != Some(self.settings.theme) {
             theme::apply(&ctx, self.settings.theme);
             self.applied_theme = Some(self.settings.theme);
+        }
+        let now = ctx.input(|i| i.time);
+        if now >= self.motion_recheck {
+            self.reduce_motion = host.reduce_motion();
+            self.motion_recheck = now + motion::RECHECK_EVERY;
+        }
+        if self.applied_motion != Some(self.reduce_motion) {
+            motion::apply(&ctx, self.reduce_motion);
+            self.applied_motion = Some(self.reduce_motion);
         }
         let tokens = Tokens::get(&ctx);
         if self.entries.iter().any(|e| e.job.is_some()) || self.checking {
@@ -428,10 +592,10 @@ impl LauncherUi {
                             ViewMode::Table => self.table(ui, &ids),
                         }
                     }
-                    self.trademark_notice(ui);
                     ui.add_space(16.0);
                 });
             });
+        self.details_drawer(&ctx);
         self.dialogs(&ctx, host);
         self.draw_toasts(&ctx);
         if host.title_bar() == TitleBar::Custom {
@@ -447,17 +611,8 @@ impl LauncherUi {
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                let s = e.status(self.platform, self.caps.manage_apps);
-                let keep = match self.settings.filter {
-                    Filter::All => true,
-                    Filter::Installed => s.is_installed(),
-                    Filter::Updates => s == AppStatus::UpdateAvailable,
-                    Filter::NotInstalled => !s.is_installed(),
-                };
-                keep && (needle.is_empty()
-                    || e.app.name.to_lowercase().contains(&needle)
-                    || e.app.tagline.to_lowercase().contains(&needle)
-                    || e.app.like.to_lowercase().contains(&needle))
+                self.in_filter(e, self.settings.filter)
+                    && (needle.is_empty() || e.app.name.to_lowercase().contains(&needle) || e.app.tagline.to_lowercase().contains(&needle))
             })
             .collect();
         let platform = self.platform;
@@ -477,7 +632,6 @@ impl LauncherUi {
             let ord = match self.settings.sort {
                 SortKey::Suite => dir(ia.cmp(ib)),
                 SortKey::Name => dir(a.app.name.cmp(b.app.name)),
-                SortKey::InspiredBy => dir(a.app.like.cmp(b.app.like)),
                 SortKey::Status => {
                     dir(crate::model::status_rank(&a.status(platform, manage)).cmp(&crate::model::status_rank(&b.status(platform, manage))))
                 }
@@ -525,18 +679,20 @@ impl LauncherUi {
     }
 
     pub(crate) fn count(&self, filter: Filter) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| {
-                let s = e.status(self.platform, self.caps.manage_apps);
-                match filter {
-                    Filter::All => true,
-                    Filter::Installed => s.is_installed(),
-                    Filter::Updates => s == AppStatus::UpdateAvailable,
-                    Filter::NotInstalled => !s.is_installed(),
-                }
-            })
-            .count()
+        self.entries.iter().filter(|e| self.in_filter(e, filter)).count()
+    }
+
+    /// Whether `entry` belongs in `filter`. Hidden apps stay out of every list except Hidden.
+    pub(crate) fn in_filter(&self, entry: &AppEntry, filter: Filter) -> bool {
+        let hidden = self.settings.hidden.contains(entry.app.id);
+        let status = entry.status(self.platform, self.caps.manage_apps);
+        match filter {
+            Filter::Hidden => hidden,
+            Filter::All => !hidden,
+            Filter::Installed => !hidden && status.is_installed(),
+            Filter::Updates => !hidden && status == AppStatus::UpdateAvailable,
+            Filter::NotInstalled => !hidden && !status.is_installed(),
+        }
     }
 
     fn draw_toasts(&mut self, ctx: &egui::Context) {
