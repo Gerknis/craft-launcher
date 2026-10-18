@@ -1,0 +1,55 @@
+# Builds the experimental Nix flake and checks the libraries winit/wgpu dlopen() at runtime are on
+# the binary's RUNPATH. A missing one still builds but fails on `nix run` ("could not be loaded",
+# "NoWaylandLib"), so the build alone does not catch it. No display is needed.
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    paths: ["flake.nix", "flake.lock", "Cargo.lock", "**/Cargo.toml", ".github/workflows/nix.yml"]
+  pull_request:
+    paths: ["flake.nix", "flake.lock", "Cargo.lock", "**/Cargo.toml", ".github/workflows/nix.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: nix build (x86_64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Build
+        run: nix build -L --no-link --print-out-paths > out-path
+
+      - name: Check runtime libraries are on the RUNPATH
+        run: |
+          bin="$(cat out-path)/bin/artcraft-launcher"
+          runpath=$(readelf -d "$bin" | sed -n -E 's/.*\((RUNPATH|RPATH)\).*\[(.*)\]/\2/p')
+          echo "RUNPATH: $runpath"
+          IFS=: read -r -a dirs <<< "$runpath"
+          missing=0
+          # Loaded with dlopen() by winit (Wayland, X11, xkbcommon) and wgpu (Vulkan, EGL/GL).
+          for lib in libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1 \
+                     libxkbcommon.so.0 libxkbcommon-x11.so.0 \
+                     libX11.so.6 libX11-xcb.so.1 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxcb.so.1 \
+                     libvulkan.so.1 libEGL.so.1 libGL.so.1; do
+            found=
+            for d in "${dirs[@]}"; do
+              if [ -e "$d/$lib" ]; then found=$d; break; fi
+            done
+            if [ -n "$found" ]; then
+              echo "ok      $lib  ($found)"
+            else
+              echo "::error::$lib is not on the RUNPATH of $bin; add its package to runtimeDependencies in flake.nix"
+              missing=1
+            fi
+          done
+          exit "$missing"

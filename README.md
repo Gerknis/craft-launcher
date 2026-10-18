@@ -200,6 +200,23 @@ rustup target add wasm32-unknown-unknown
 cd apps/artcraft-launcher-web && trunk serve
 ```
 
+### Nix (experimental)
+
+`flake.nix` gives a dev shell (`nix develop`, then the cargo commands above) and a package:
+
+```sh
+nix run github:storytold/craft-launcher
+```
+
+On NixOS this uses the system's graphics drivers. On other distros, a Nix-built program can't load
+the host's GPU drivers, so the window may fail to open. Run it through
+[nixGL](https://github.com/nix-community/nixGL) instead (NVIDIA needs nixGL's matching NVIDIA
+variant), or use the AppImage, `.deb` or `.rpm` release:
+
+```sh
+nix run --impure github:nix-community/nixGL -- nix run github:storytold/craft-launcher
+```
+
 ### Installing your own builds
 
 To install and update the Craft apps from checkouts on your machine instead of GitHub, clone them
