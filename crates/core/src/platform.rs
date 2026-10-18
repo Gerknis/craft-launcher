@@ -136,14 +136,17 @@ impl Platform {
     }
 
     /// Asset platform tokens to try, best first. Windows on ARM and 64-bit Windows can fall back
-    /// to emulated builds; macOS releases are universal.
+    /// to emulated builds; macOS prefers universal, then native builds. Apple silicon can fall
+    /// back to Intel builds, but Intel Macs cannot run ARM builds.
     fn tokens(self) -> &'static [&'static str] {
         match (self.os, self.arch) {
             (Os::Windows, Arch::X64) => &["windows-x64", "windows-x86"],
             (Os::Windows, Arch::X86) => &["windows-x86"],
             (Os::Windows, Arch::Arm64) => &["windows-arm64", "windows-x64", "windows-x86"],
             (Os::Windows, _) => &[],
-            (Os::MacOs, _) => &["macos-universal", "macos-aarch64", "macos-arm64", "macos-x86_64"],
+            (Os::MacOs, Arch::X64) => &["macos-universal", "macos-x86_64"],
+            (Os::MacOs, Arch::Arm64) => &["macos-universal", "macos-aarch64", "macos-arm64", "macos-x86_64"],
+            (Os::MacOs, _) => &[],
             (Os::Linux, Arch::X64) => &["linux-x86_64"],
             (Os::Linux, Arch::Arm64) => &["linux-aarch64"],
             (Os::Linux, Arch::Riscv64) => &["linux-riscv64"],
@@ -251,6 +254,52 @@ mod tests {
         "photocraft-web-0.5.0.zip",
         "SHA256SUMS.txt",
     ];
+
+    #[test]
+    fn macos_prefers_the_published_universal_build() {
+        // PhotoCraft v0.9.0's GitHub metadata, trimmed to its desktop DMG.
+        let mut r = crate::release::parse_github_release(include_str!("../tests/fixtures/photocraft-release.json"), "storytold/photocraft").unwrap();
+        // Split builds must not outrank the published universal DMG, even when listed first.
+        r.assets.splice(0..0, release(&["photocraft-0.9.0-macos-arm64.dmg", "photocraft-0.9.0-macos-x86_64.dmg"]).assets);
+        for arch in [Arch::X64, Arch::Arm64] {
+            let (asset, kind) = pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch }, &[PackageKind::Dmg]).unwrap();
+            assert_eq!(asset.name, "photocraft-0.9.0-macos-universal.dmg");
+            assert_eq!(kind, PackageKind::Dmg);
+        }
+    }
+
+    #[test]
+    fn macos_split_builds_match_the_processor() {
+        let r = release(&["photocraft-0.5.0-macos-arm64.dmg", "photocraft-0.5.0-macos-x86_64.dmg"]);
+        let pick = |arch| pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch }, &[PackageKind::Dmg]).map(|(a, _)| a.name.as_str());
+        assert_eq!(pick(Arch::X64), Some("photocraft-0.5.0-macos-x86_64.dmg"));
+        assert_eq!(pick(Arch::Arm64), Some("photocraft-0.5.0-macos-arm64.dmg"));
+    }
+
+    #[test]
+    fn intel_macos_never_selects_an_arm_only_build() {
+        for token in ["macos-aarch64", "macos-arm64"] {
+            let name = format!("photocraft-0.5.0-{token}.dmg");
+            let r = release(&[&name]);
+            assert_eq!(pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch: Arch::X64 }, &[PackageKind::Dmg]), None);
+            assert_eq!(
+                pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch: Arch::Arm64 }, &[PackageKind::Dmg]).map(|(a, _)| a.name.as_str()),
+                Some(name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn apple_silicon_keeps_the_intel_fallback() {
+        let r = release(&["photocraft-0.5.0-macos-x86_64.dmg"]);
+        assert_eq!(
+            pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch: Arch::Arm64 }, &[PackageKind::Dmg]).map(|(a, _)| a.name.as_str()),
+            Some("photocraft-0.5.0-macos-x86_64.dmg")
+        );
+        for arch in [Arch::X86, Arch::Riscv64] {
+            assert_eq!(pick_asset(&r, &["photocraft"], Platform { os: Os::MacOs, arch }, &[PackageKind::Dmg]), None);
+        }
+    }
 
     #[test]
     fn reads_asset_names() {
